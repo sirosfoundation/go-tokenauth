@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-tokenauth/validator"
 )

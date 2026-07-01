@@ -10,6 +10,7 @@ import (
 	gojose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	gojwt "github.com/golang-jwt/jwt/v5"
+
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-tokenauth/jwks"
 	"github.com/sirosfoundation/go-tokenauth/revocation"

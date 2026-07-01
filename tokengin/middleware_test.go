@@ -11,9 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	gojose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
-	"github.com/gin-gonic/gin"
+
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-tokenauth/validator"
 )

@@ -17,13 +17,13 @@ import (
 
 // Fetcher maintains a cached copy of JWKS keys from a remote endpoint.
 type Fetcher struct {
-	url      string
-	refresh  time.Duration
-	client   *http.Client
-	mu       sync.RWMutex
-	keySet   *jose.JSONWebKeySet
+	url       string
+	refresh   time.Duration
+	client    *http.Client
+	mu        sync.RWMutex
+	keySet    *jose.JSONWebKeySet
 	lastFetch time.Time
-	cancel   context.CancelFunc
+	cancel    context.CancelFunc
 }
 
 // NewFetcher creates a JWKS fetcher for the given URL.
