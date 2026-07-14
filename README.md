@@ -6,6 +6,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/sirosfoundation/go-tokenauth.svg)](https://pkg.go.dev/github.com/sirosfoundation/go-tokenauth)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sirosfoundation/go-tokenauth)](https://goreportcard.com/report/github.com/sirosfoundation/go-tokenauth)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/sirosfoundation/go-tokenauth)](go.mod)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sirosfoundation/go-tokenauth/badge)](https://scorecard.dev/viewer/?uri=github.com/sirosfoundation/go-tokenauth)
 [![License](https://img.shields.io/badge/License-BSD_2--Clause-orange.svg)](LICENSE)
 
 </div>
