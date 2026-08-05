@@ -102,4 +102,14 @@ type Result struct {
 	ACR      string
 	JTI      string
 	Mode     AuthMode
+
+	// Audience is the token's "aud" claim(s), verbatim (may be empty for
+	// legacy tokens that never carried one). Exposed so a service that
+	// accepts more than one audience (e.g. validating against a shared
+	// Config.Audiences allowlist) can still restrict specific routes/
+	// purposes to a narrower audience than "any accepted value" - the
+	// validator itself only checks membership in the configured allowlist,
+	// it doesn't know which specific audience a given call site actually
+	// needs.
+	Audience []string
 }

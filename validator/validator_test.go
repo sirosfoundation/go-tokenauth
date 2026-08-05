@@ -104,6 +104,9 @@ func TestValidator_Asymmetric_Success(t *testing.T) {
 	if result.Mode != claims.ModeSession {
 		t.Errorf("expected mode session, got %s", result.Mode)
 	}
+	if len(result.Audience) != 1 || result.Audience[0] != "api" {
+		t.Errorf("expected Audience [api], got %v", result.Audience)
+	}
 }
 
 func TestValidator_Asymmetric_WrongIssuer(t *testing.T) {
@@ -193,6 +196,9 @@ func TestValidator_Legacy_Success(t *testing.T) {
 	}
 	if result.Mode != claims.ModeLegacy {
 		t.Errorf("expected mode legacy, got %s", result.Mode)
+	}
+	if len(result.Audience) != 1 || result.Audience[0] != "api" {
+		t.Errorf("expected Audience [api], got %v", result.Audience)
 	}
 }
 

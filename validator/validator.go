@@ -182,6 +182,7 @@ func (v *Validator) validateAsymmetric(ctx context.Context, rawToken string) (*c
 		ACR:      ac.ACR,
 		JTI:      ac.ID,
 		Mode:     claims.ModeSession,
+		Audience: []string(ac.Audience),
 	}, nil
 }
 
@@ -242,5 +243,6 @@ func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
 		TenantID: lc.TenantID,
 		JTI:      lc.ID,
 		Mode:     claims.ModeLegacy,
+		Audience: []string(lc.Audience),
 	}, nil
 }
