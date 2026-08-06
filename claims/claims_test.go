@@ -44,3 +44,20 @@ func TestTAC_Validate(t *testing.T) {
 		t.Errorf("empty TAC should be valid: %v", err)
 	}
 }
+
+func TestResult_HasAudience(t *testing.T) {
+	r := &Result{Audience: []string{"wallet-registry"}}
+	if !r.HasAudience("wallet-registry", "wallet-backend") {
+		t.Error("expected HasAudience(wallet-registry, wallet-backend) = true")
+	}
+	if r.HasAudience("wallet-backend") {
+		t.Error("expected HasAudience(wallet-backend) = false")
+	}
+}
+
+func TestResult_HasAudience_Empty(t *testing.T) {
+	r := &Result{}
+	if r.HasAudience("wallet-backend") {
+		t.Error("expected HasAudience on empty Audience = false")
+	}
+}
