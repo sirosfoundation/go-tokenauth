@@ -113,3 +113,15 @@ type Result struct {
 	// needs.
 	Audience []string
 }
+
+// HasAudience returns true if Audience contains at least one of allowed.
+func (r *Result) HasAudience(allowed ...string) bool {
+	for _, aud := range r.Audience {
+		for _, want := range allowed {
+			if aud == want {
+				return true
+			}
+		}
+	}
+	return false
+}
