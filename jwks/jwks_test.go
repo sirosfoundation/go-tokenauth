@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/go-jose/go-jose/v4"
@@ -102,5 +103,53 @@ func TestFetcher_Start(t *testing.T) {
 	ks := f.KeySet()
 	if ks == nil {
 		t.Fatal("expected keys after Start")
+	}
+}
+
+func TestFetcher_Fetch_ReusesTenantHeader(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwk := jose.JSONWebKey{
+		Key:       key.Public(),
+		KeyID:     "test-kid",
+		Algorithm: string(jose.ES256),
+		Use:       "sig",
+	}
+	ks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+
+	var (
+		mu      sync.Mutex
+		headers []string
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		headers = append(headers, r.Header.Get("X-Tenant-ID"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	f := NewFetcher(ts.URL, 0, nil)
+	if err := f.fetch(ContextWithTenantID(context.Background(), "tenant-1")); err != nil {
+		t.Fatalf("first fetch failed: %v", err)
+	}
+	if err := f.fetch(context.Background()); err != nil {
+		t.Fatalf("second fetch failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(headers) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(headers))
+	}
+	if headers[0] != "tenant-1" {
+		t.Fatalf("expected first request header tenant-1, got %q", headers[0])
+	}
+	if headers[1] != "tenant-1" {
+		t.Fatalf("expected cached tenant header tenant-1, got %q", headers[1])
 	}
 }

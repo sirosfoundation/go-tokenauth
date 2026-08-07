@@ -22,8 +22,16 @@ type Fetcher struct {
 	client    *http.Client
 	mu        sync.RWMutex
 	keySet    *jose.JSONWebKeySet
+	tenantID  string
 	lastFetch time.Time
 	cancel    context.CancelFunc
+}
+
+type tenantIDContextKey struct{}
+
+// ContextWithTenantID attaches a tenant ID to ctx for issuer-bound requests.
+func ContextWithTenantID(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, tenantIDContextKey{}, tenantID)
 }
 
 // NewFetcher creates a JWKS fetcher for the given URL.
@@ -116,6 +124,19 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 		return fmt.Errorf("jwks: failed to create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	if tenantID, ok := ctx.Value(tenantIDContextKey{}).(string); ok && tenantID != "" {
+		f.mu.Lock()
+		f.tenantID = tenantID
+		f.mu.Unlock()
+		req.Header.Set("X-Tenant-ID", tenantID)
+	} else {
+		f.mu.RLock()
+		tenantID := f.tenantID
+		f.mu.RUnlock()
+		if tenantID != "" {
+			req.Header.Set("X-Tenant-ID", tenantID)
+		}
+	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {
