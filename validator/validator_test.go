@@ -42,6 +42,10 @@ func setupASServer(t *testing.T) (*httptest.Server, *ecdsa.PrivateKey, string) {
 }
 
 func issueTestToken(t *testing.T, key *ecdsa.PrivateKey, kid, issuer, audience, tenantID string, tac claims.TAC) string {
+	return issueTestTokenWithRoutingTenant(t, key, kid, issuer, audience, tenantID, "", tac)
+}
+
+func issueTestTokenWithRoutingTenant(t *testing.T, key *ecdsa.PrivateKey, kid, issuer, audience, tenantID, routingTenant string, tac claims.TAC) string {
 	t.Helper()
 	sig, err := gojose.NewSigner(
 		gojose.SigningKey{Algorithm: gojose.ES256, Key: key},
@@ -67,7 +71,14 @@ func issueTestToken(t *testing.T, key *ecdsa.PrivateKey, kid, issuer, audience, 
 		ACR:      "urn:siros:acr:passkey",
 	}
 
-	token, err := jwt.Signed(sig).Claims(cl).Serialize()
+	builder := jwt.Signed(sig).Claims(cl)
+	if routingTenant != "" {
+		builder = builder.Claims(struct {
+			Tenant string `json:"tenant"`
+		}{Tenant: routingTenant})
+	}
+
+	token, err := builder.Serialize()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,5 +269,79 @@ func TestValidator_Asymmetric_Revoked(t *testing.T) {
 	_, err := v.Validate(ctx, token)
 	if err == nil {
 		t.Error("expected error for revoked token")
+	}
+}
+
+func TestValidator_Asymmetric_SendsTenantHeaderForIssuerRequests(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwk := gojose.JSONWebKey{
+		Key:       key.Public(),
+		KeyID:     "test-kid",
+		Algorithm: string(gojose.ES256),
+		Use:       "sig",
+	}
+	ks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
+
+	var seenTenant string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenTenant = r.Header.Get("X-Tenant-ID")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	v := New(Config{
+		JWKSURL:   ts.URL,
+		Issuer:    "test-issuer",
+		Audiences: []string{"api"},
+	})
+
+	token := issueTestTokenWithRoutingTenant(t, key, "test-kid", "test-issuer", "api", "tenant-id-1", "tenant-1", claims.TAC("rl"))
+	if _, err := v.Validate(context.Background(), token); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if seenTenant != "tenant-1" {
+		t.Fatalf("expected X-Tenant-ID tenant-1, got %q", seenTenant)
+	}
+}
+
+func TestValidator_Asymmetric_IgnoresInvalidRoutingTenant(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwk := gojose.JSONWebKey{
+		Key:       key.Public(),
+		KeyID:     "test-kid",
+		Algorithm: string(gojose.ES256),
+		Use:       "sig",
+	}
+	ks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
+
+	var seenTenant string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenTenant = r.Header.Get("X-Tenant-ID")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	v := New(Config{
+		JWKSURL:   ts.URL,
+		Issuer:    "test-issuer",
+		Audiences: []string{"api"},
+	})
+
+	token := issueTestTokenWithRoutingTenant(t, key, "test-kid", "test-issuer", "api", "tenant-1", "Tenant_1", claims.TAC("rl"))
+	if _, err := v.Validate(context.Background(), token); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if seenTenant != "" {
+		t.Fatalf("expected no X-Tenant-ID header for invalid tenant, got %q", seenTenant)
 	}
 }

@@ -4,7 +4,11 @@ package validator
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	gojose "github.com/go-jose/go-jose/v4"
@@ -15,6 +19,8 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/jwks"
 	"github.com/sirosfoundation/go-tokenauth/revocation"
 )
+
+var rfc1123LabelPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
 // Config configures the token validator.
 type Config struct {
@@ -144,6 +150,10 @@ func (v *Validator) validateAsymmetric(ctx context.Context, rawToken string) (*c
 		return nil, fmt.Errorf("tokenauth: token missing kid header")
 	}
 
+	if tenantID := issuerRequestTenantID(rawToken); tenantID != "" {
+		ctx = jwks.ContextWithTenantID(ctx, tenantID)
+	}
+
 	keys, err := v.fetcher.GetKey(ctx, kid)
 	if err != nil {
 		return nil, fmt.Errorf("tokenauth: key lookup failed: %w", err)
@@ -245,4 +255,39 @@ func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
 		Mode:     claims.ModeLegacy,
 		Audience: []string(lc.Audience),
 	}, nil
+}
+
+type issuerRoutingClaims struct {
+	Tenant   string `json:"tenant"`
+	TenantID string `json:"tenant_id"`
+}
+
+func issuerRequestTenantID(rawToken string) string {
+	parts := strings.Split(rawToken, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+
+	var rc issuerRoutingClaims
+	if err := json.Unmarshal(payload, &rc); err != nil {
+		return ""
+	}
+
+	if rc.Tenant != "" {
+		if rfc1123LabelPattern.MatchString(rc.Tenant) {
+			return rc.Tenant
+		}
+		return ""
+	}
+
+	if rc.TenantID != "" && rfc1123LabelPattern.MatchString(rc.TenantID) {
+		return rc.TenantID
+	}
+
+	return ""
 }
