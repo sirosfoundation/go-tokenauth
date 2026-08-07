@@ -285,7 +285,7 @@ func issuerRequestTenantID(rawToken string) string {
 		return ""
 	}
 
-	if rfc1123LabelPattern.MatchString(rc.TenantID) {
+	if rc.TenantID != "" && rfc1123LabelPattern.MatchString(rc.TenantID) {
 		return rc.TenantID
 	}
 
