@@ -124,6 +124,11 @@ func TestTokenAuth_NoToken(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
 	}
+	// RFC 6750 §3: no bearer token was even presented, so the challenge
+	// is invalid_request, not invalid_token.
+	if want, got := `Bearer error="invalid_request"`, w.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
 }
 
 func TestTokenAuth_InvalidToken(t *testing.T) {
@@ -136,6 +141,74 @@ func TestTokenAuth_InvalidToken(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
+	}
+	if want, got := `Bearer error="invalid_token", error_description="the access token is invalid"`, w.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	// The existing "error" field/value must not change — existing
+	// consumers (e.g. go-wallet-backend) may already match on it.
+	if got := body["error"]; got != "invalid token" {
+		t.Errorf(`body["error"] = %q, want "invalid token"`, got)
+	}
+	if got := body["error_description"]; got != "the access token is invalid" {
+		t.Errorf(`body["error_description"] = %q, want "the access token is invalid"`, got)
+	}
+}
+
+func TestTokenAuth_ExpiredToken(t *testing.T) {
+	router, key, kid := setupMiddleware(t)
+
+	sig, err := gojose.NewSigner(
+		gojose.SigningKey{Algorithm: gojose.ES256, Key: key},
+		(&gojose.SignerOptions{}).WithType("JWT").WithHeader("kid", kid),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	cl := claims.AccessTokenClaims{
+		Claims: jwt.Claims{
+			ID:       "jti-mw-expired",
+			Issuer:   "test-issuer",
+			Subject:  "user-1",
+			Audience: jwt.Audience{"api"},
+			IssuedAt: jwt.NewNumericDate(now.Add(-time.Hour)),
+			Expiry:   jwt.NewNumericDate(now.Add(-time.Minute)),
+		},
+		TenantID: "tenant-1",
+		TAC:      claims.TAC("rwl"),
+	}
+	token, err := jwt.Signed(sig).Claims(cl).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+	if want, got := `Bearer error="invalid_token", error_description="the access token expired"`, w.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got := body["error"]; got != "invalid token" {
+		t.Errorf(`body["error"] = %q, want "invalid token"`, got)
+	}
+	if got := body["error_description"]; got != "the access token expired" {
+		t.Errorf(`body["error_description"] = %q, want "the access token expired"`, got)
 	}
 }
 

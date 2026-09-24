@@ -2,10 +2,13 @@
 package tokengin
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
+	golangjwt "github.com/golang-jwt/jwt/v5"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-tokenauth/validator"
@@ -20,6 +23,10 @@ func TokenAuth(v *validator.Validator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := extractBearerToken(c)
 		if token == "" {
+			// RFC 6750 §3: the request itself is malformed (no bearer
+			// token was even presented), as distinct from a bearer
+			// token that was presented but rejected below.
+			c.Header("WWW-Authenticate", `Bearer error="invalid_request"`)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": "missing authorization token",
 			})
@@ -28,8 +35,15 @@ func TokenAuth(v *validator.Validator) gin.HandlerFunc {
 
 		result, err := v.Validate(c.Request.Context(), token)
 		if err != nil {
+			description := invalidTokenDescription(err)
+			c.Header("WWW-Authenticate", `Bearer error="invalid_token", error_description="`+description+`"`)
+			// The existing "error" field/value is kept as-is for
+			// backward compatibility with existing consumers (e.g.
+			// go-wallet-backend) that may already match on it;
+			// error_description is new and additive.
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "invalid token",
+				"error":             "invalid token",
+				"error_description": description,
 			})
 			return
 		}
@@ -82,4 +96,25 @@ func extractBearerToken(c *gin.Context) string {
 		return ""
 	}
 	return parts[1]
+}
+
+// invalidTokenDescription distinguishes an expired token from every
+// other reason validator.Validate rejects a token, for the RFC 6750 §3
+// error_description on an invalid_token challenge. There is no separate
+// "expired" error code in RFC 6750 — expiry is signaled via
+// error_description on invalid_token.
+//
+// validator.Validate has two live code paths depending on the token's
+// alg header, each wrapping a different package's expiry sentinel
+// through the returned error chain, so both are checked:
+//   - asymmetric tokens (ES256/ES384/EdDSA): go-jose/go-jose's
+//     jwt.ErrExpired, from claim validation.
+//   - legacy tokens (HS256/HS384/HS512): golang-jwt/jwt/v5's
+//     jwt.ErrTokenExpired, a different sentinel from a different
+//     package, not the same as the asymmetric path's.
+func invalidTokenDescription(err error) string {
+	if errors.Is(err, gojosejwt.ErrExpired) || errors.Is(err, golangjwt.ErrTokenExpired) {
+		return "the access token expired"
+	}
+	return "the access token is invalid"
 }
