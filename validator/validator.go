@@ -166,13 +166,19 @@ func (v *Validator) validateAsymmetric(ctx context.Context, rawToken string) (*c
 		return nil, fmt.Errorf("tokenauth: signature verification failed: %w", err)
 	}
 
+	// Audience validation is mandatory: an empty configured audience list is
+	// a configuration error, not permission to skip the check. go-jose's
+	// jwt.Expected treats an empty AnyAudience as "don't check audience at
+	// all", which would fail open, so we refuse to validate instead.
+	if len(v.cfg.Audiences) == 0 {
+		return nil, fmt.Errorf("tokenauth: no audiences configured; refusing to validate without an audience restriction")
+	}
+
 	// Validate standard claims.
 	expected := jwt.Expected{
-		Issuer: v.cfg.Issuer,
-		Time:   time.Now(),
-	}
-	if len(v.cfg.Audiences) > 0 {
-		expected.AnyAudience = v.cfg.Audiences
+		Issuer:      v.cfg.Issuer,
+		AnyAudience: v.cfg.Audiences,
+		Time:        time.Now(),
 	}
 	if err := ac.ValidateWithLeeway(expected, v.cfg.Leeway); err != nil {
 		return nil, fmt.Errorf("tokenauth: claim validation failed: %w", err)
@@ -206,16 +212,36 @@ type LegacyTokenClaims struct {
 
 // validateLegacy validates a legacy HMAC-signed token.
 func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
+	// Audience validation is mandatory: an empty configured audience list is
+	// a configuration error, not permission to skip the check (omitting
+	// gojwt.WithAudience entirely disables audience enforcement, which
+	// would fail open).
+	if len(v.cfg.Audiences) == 0 {
+		return nil, fmt.Errorf("tokenauth: no audiences configured; refusing to validate without an audience restriction")
+	}
+
+	// Legacy.Issuers is the source of truth for which issuers legacy tokens
+	// may carry. Callers that only set the shared Config.Issuer (used by the
+	// asymmetric path) without duplicating it into Legacy.Issuers still get
+	// an issuer check here rather than silently having none.
+	issuers := v.cfg.Legacy.Issuers
+	if len(issuers) == 0 && v.cfg.Issuer != "" {
+		issuers = []string{v.cfg.Issuer}
+	}
+	if len(issuers) == 0 {
+		return nil, fmt.Errorf("tokenauth: no legacy issuers configured; refusing to validate without an issuer restriction")
+	}
+
 	opts := []gojwt.ParserOption{
 		gojwt.WithLeeway(v.cfg.Leeway),
-	}
-	// Add issuer validation if configured.
-	if len(v.cfg.Legacy.Issuers) > 0 {
-		// golang-jwt only supports single issuer — check first, validate rest manually.
-		opts = append(opts, gojwt.WithIssuer(v.cfg.Legacy.Issuers[0]))
-	}
-	for _, aud := range v.cfg.Audiences {
-		opts = append(opts, gojwt.WithAudience(aud))
+		// golang-jwt only supports single issuer validation via ParserOption —
+		// check the first here, validate the full accepted set manually below.
+		gojwt.WithIssuer(issuers[0]),
+		// A single call with all configured audiences: golang-jwt v5's
+		// WithAudience REPLACES the parser's expected-audience set on every
+		// call rather than accumulating, so calling it once per audience in
+		// a loop silently dropped every audience but the last.
+		gojwt.WithAudience(v.cfg.Audiences...),
 	}
 
 	token, err := gojwt.ParseWithClaims(rawToken, &LegacyTokenClaims{}, func(t *gojwt.Token) (interface{}, error) {
@@ -233,10 +259,10 @@ func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
 		return nil, fmt.Errorf("tokenauth: invalid legacy token claims")
 	}
 
-	// Check additional issuers if more than one configured.
-	if len(v.cfg.Legacy.Issuers) > 1 {
+	// Check additional issuers if more than one is accepted.
+	if len(issuers) > 1 {
 		issuerOK := false
-		for _, iss := range v.cfg.Legacy.Issuers {
+		for _, iss := range issuers {
 			if lc.Issuer == iss {
 				issuerOK = true
 				break

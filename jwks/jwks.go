@@ -16,13 +16,19 @@ import (
 )
 
 // Fetcher maintains a cached copy of JWKS keys from a remote endpoint.
+//
+// Fetcher instances are shared across concurrent callers (e.g. one Fetcher
+// per Validator, serving every request that Validator handles). Nothing
+// derived from a single caller's unverified claims may be stored on the
+// struct itself, since that would leak between unrelated callers sharing
+// the instance — see ContextWithTenantID, which is threaded through per
+// call via context.Context instead.
 type Fetcher struct {
 	url       string
 	refresh   time.Duration
 	client    *http.Client
 	mu        sync.RWMutex
 	keySet    *jose.JSONWebKeySet
-	tenantID  string
 	lastFetch time.Time
 	cancel    context.CancelFunc
 }
@@ -124,18 +130,13 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 		return fmt.Errorf("jwks: failed to create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	// The tenant ID comes from an unverified JWT claim (see
+	// issuerRequestTenantID in the validator package) and is derived fresh
+	// per call from ctx — it must never be persisted on the shared Fetcher,
+	// or one caller's unverified claim would leak into another caller's
+	// request that shares this Fetcher instance.
 	if tenantID, ok := ctx.Value(tenantIDContextKey{}).(string); ok && tenantID != "" {
-		f.mu.Lock()
-		f.tenantID = tenantID
-		f.mu.Unlock()
 		req.Header.Set("X-Tenant-ID", tenantID)
-	} else {
-		f.mu.RLock()
-		tenantID := f.tenantID
-		f.mu.RUnlock()
-		if tenantID != "" {
-			req.Header.Set("X-Tenant-ID", tenantID)
-		}
 	}
 
 	resp, err := f.client.Do(req)

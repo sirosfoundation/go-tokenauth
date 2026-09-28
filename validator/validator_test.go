@@ -160,6 +160,250 @@ func TestValidator_Asymmetric_WrongAudience(t *testing.T) {
 	}
 }
 
+// TestValidator_Asymmetric_FirstOfSeveralAudiences proves that a token
+// bearing only the FIRST of several configured audiences validates
+// successfully. Regression test for the "last-wins" bug: golang-jwt v5's
+// WithAudience(...) is variadic but REPLACES the parser's expected-audience
+// set on each call, so building parser options with one WithAudience call
+// per configured audience (in a loop) silently dropped every audience but
+// the last that was appended. A token carrying only the first-configured
+// audience would then be falsely rejected. The asymmetric path uses
+// go-jose's jwt.Expected.AnyAudience directly (not golang-jwt's parser
+// options) but is exercised here too for parity with the legacy path.
+func TestValidator_Asymmetric_FirstOfSeveralAudiences(t *testing.T) {
+	ts, key, kid := setupASServer(t)
+	ctx := context.Background()
+
+	v := New(Config{
+		JWKSURL:   ts.URL,
+		Issuer:    "test-issuer",
+		Audiences: []string{"first-api", "second-api", "third-api"},
+	})
+	v.Start(ctx)
+	defer v.Stop()
+
+	token := issueTestToken(t, key, kid, "test-issuer", "first-api", "tenant-1", claims.TAC("rl"))
+
+	result, err := v.Validate(ctx, token)
+	if err != nil {
+		t.Fatalf("expected token with first-configured audience to validate, got error: %v", err)
+	}
+	if len(result.Audience) != 1 || result.Audience[0] != "first-api" {
+		t.Errorf("expected Audience [first-api], got %v", result.Audience)
+	}
+}
+
+// TestValidator_Legacy_FirstOfSeveralAudiences is the legacy-path
+// counterpart of TestValidator_Asymmetric_FirstOfSeveralAudiences. The
+// legacy path is the one that built golang-jwt v5 ParserOptions in a loop
+// and is where the last-wins bug actually lived.
+func TestValidator_Legacy_FirstOfSeveralAudiences(t *testing.T) {
+	secret := []byte("test-hmac-secret-32-bytes-long!!")
+	ctx := context.Background()
+
+	v := New(Config{
+		Issuer:    "legacy-issuer",
+		Audiences: []string{"first-api", "second-api", "third-api"},
+		Legacy: LegacyConfig{
+			Enabled:    true,
+			HMACSecret: secret,
+			Issuers:    []string{"legacy-issuer"},
+		},
+	})
+
+	now := time.Now()
+	lc := &LegacyTokenClaims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ID:        "jti-legacy-first-aud",
+			Issuer:    "legacy-issuer",
+			Subject:   "user-1",
+			Audience:  gojwt.ClaimStrings{"first-api"},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
+		},
+		UserID: "user-1",
+	}
+
+	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
+	raw, err := token.SignedString(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := v.Validate(ctx, raw)
+	if err != nil {
+		t.Fatalf("expected legacy token with first-configured audience to validate, got error: %v", err)
+	}
+	if len(result.Audience) != 1 || result.Audience[0] != "first-api" {
+		t.Errorf("expected Audience [first-api], got %v", result.Audience)
+	}
+}
+
+// TestValidator_Legacy_WrongIssuerRejected proves a legacy token with an
+// issuer outside the accepted set is rejected, and specifically that
+// Legacy.Issuers is actually consulted when only the shared top-level
+// Config.Issuer would otherwise be set.
+func TestValidator_Legacy_WrongIssuerRejected(t *testing.T) {
+	secret := []byte("test-hmac-secret-32-bytes-long!!")
+	ctx := context.Background()
+
+	v := New(Config{
+		Issuer:    "legacy-issuer",
+		Audiences: []string{"api"},
+		Legacy: LegacyConfig{
+			Enabled:    true,
+			HMACSecret: secret,
+			Issuers:    []string{"legacy-issuer"},
+		},
+	})
+
+	now := time.Now()
+	lc := &LegacyTokenClaims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ID:        "jti-legacy-bad-iss",
+			Issuer:    "attacker-issuer",
+			Subject:   "user-1",
+			Audience:  gojwt.ClaimStrings{"api"},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
+		},
+		UserID: "user-1",
+	}
+
+	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
+	raw, err := token.SignedString(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := v.Validate(ctx, raw); err == nil {
+		t.Error("expected error for legacy token with unaccepted issuer")
+	}
+}
+
+// TestValidator_Legacy_IssuerFallsBackToSharedIssuer proves that when a
+// caller only sets the shared Config.Issuer (not Legacy.Issuers), legacy
+// tokens still get an issuer check rather than none at all. This was the
+// "Legacy.Issuers is never populated by any caller path" gap: real callers
+// commonly set only Config.Issuer, expecting it to apply to both token
+// kinds.
+func TestValidator_Legacy_IssuerFallsBackToSharedIssuer(t *testing.T) {
+	secret := []byte("test-hmac-secret-32-bytes-long!!")
+	ctx := context.Background()
+
+	v := New(Config{
+		Issuer:    "shared-issuer",
+		Audiences: []string{"api"},
+		Legacy: LegacyConfig{
+			Enabled:    true,
+			HMACSecret: secret,
+			// Issuers deliberately left unset.
+		},
+	})
+
+	now := time.Now()
+	badIssuer := &LegacyTokenClaims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ID:        "jti-legacy-fallback-bad",
+			Issuer:    "attacker-issuer",
+			Subject:   "user-1",
+			Audience:  gojwt.ClaimStrings{"api"},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
+		},
+		UserID: "user-1",
+	}
+	badToken := gojwt.NewWithClaims(gojwt.SigningMethodHS256, badIssuer)
+	rawBad, err := badToken.SignedString(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Validate(ctx, rawBad); err == nil {
+		t.Error("expected error for legacy token whose issuer doesn't match the shared Config.Issuer fallback")
+	}
+
+	goodIssuer := &LegacyTokenClaims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ID:        "jti-legacy-fallback-good",
+			Issuer:    "shared-issuer",
+			Subject:   "user-1",
+			Audience:  gojwt.ClaimStrings{"api"},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
+		},
+		UserID: "user-1",
+	}
+	goodToken := gojwt.NewWithClaims(gojwt.SigningMethodHS256, goodIssuer)
+	rawGood, err := goodToken.SignedString(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Validate(ctx, rawGood); err != nil {
+		t.Fatalf("expected legacy token matching the shared Config.Issuer fallback to validate, got: %v", err)
+	}
+}
+
+// TestValidator_Asymmetric_EmptyAudiencesIsConfigError proves that an
+// empty/unset Audiences list is treated as a configuration error and fails
+// closed, rather than silently disabling audience enforcement.
+func TestValidator_Asymmetric_EmptyAudiencesIsConfigError(t *testing.T) {
+	ts, key, kid := setupASServer(t)
+	ctx := context.Background()
+
+	v := New(Config{
+		JWKSURL: ts.URL,
+		Issuer:  "test-issuer",
+		// Audiences deliberately left empty.
+	})
+	v.Start(ctx)
+	defer v.Stop()
+
+	token := issueTestToken(t, key, kid, "test-issuer", "anything-goes", "tenant-1", claims.TAC("rl"))
+
+	if _, err := v.Validate(ctx, token); err == nil {
+		t.Error("expected error when no audiences are configured, got nil (fail-open)")
+	}
+}
+
+// TestValidator_Legacy_EmptyAudiencesIsConfigError is the legacy-path
+// counterpart of TestValidator_Asymmetric_EmptyAudiencesIsConfigError.
+func TestValidator_Legacy_EmptyAudiencesIsConfigError(t *testing.T) {
+	secret := []byte("test-hmac-secret-32-bytes-long!!")
+	ctx := context.Background()
+
+	v := New(Config{
+		Issuer: "legacy-issuer",
+		// Audiences deliberately left empty.
+		Legacy: LegacyConfig{
+			Enabled:    true,
+			HMACSecret: secret,
+			Issuers:    []string{"legacy-issuer"},
+		},
+	})
+
+	now := time.Now()
+	lc := &LegacyTokenClaims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ID:        "jti-legacy-no-aud-cfg",
+			Issuer:    "legacy-issuer",
+			Subject:   "user-1",
+			Audience:  gojwt.ClaimStrings{"anything-goes"},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
+		},
+		UserID: "user-1",
+	}
+	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
+	raw, err := token.SignedString(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := v.Validate(ctx, raw); err == nil {
+		t.Error("expected error when no audiences are configured, got nil (fail-open)")
+	}
+}
+
 func TestValidator_Legacy_Success(t *testing.T) {
 	secret := []byte("test-hmac-secret-32-bytes-long!!")
 	ctx := context.Background()
