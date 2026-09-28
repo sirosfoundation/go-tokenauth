@@ -21,6 +21,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Without a coverage report, Sonar reads every line touched by a PR as
+      # 0% covered new code and fails the quality gate's new_coverage gate
+      # regardless of how much testing the PR actually added — this job
+      # never ran `go test` at all before, so every PR touching Go source
+      # hit this. Every other Go repo in the org runs tests with a coverage
+      # profile here and passes it via sonar.go.coverage.reportPaths; this
+      # brings go-tokenauth in line with that pattern.
+      - name: Run tests with coverage
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v8
         env:
@@ -29,3 +43,5 @@ jobs:
           args: >
             -Dsonar.organization=${{ github.repository_owner }}
             -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.test.inclusions=**/*_test.go
