@@ -234,14 +234,17 @@ func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
 
 	opts := []gojwt.ParserOption{
 		gojwt.WithLeeway(v.cfg.Leeway),
-		// golang-jwt only supports single issuer validation via ParserOption —
-		// check the first here, validate the full accepted set manually below.
-		gojwt.WithIssuer(issuers[0]),
 		// A single call with all configured audiences: golang-jwt v5's
 		// WithAudience REPLACES the parser's expected-audience set on every
 		// call rather than accumulating, so calling it once per audience in
 		// a loop silently dropped every audience but the last.
 		gojwt.WithAudience(v.cfg.Audiences...),
+		// Deliberately NOT using gojwt.WithIssuer here: it only supports a
+		// single exact issuer and enforces it inside ParseWithClaims itself,
+		// which would hard-reject a token using any accepted issuer other
+		// than issuers[0] before the manual multi-issuer check below ever
+		// runs. Issuer membership is checked manually after parsing instead,
+		// uniformly for one or many configured issuers.
 	}
 
 	token, err := gojwt.ParseWithClaims(rawToken, &LegacyTokenClaims{}, func(t *gojwt.Token) (interface{}, error) {
@@ -259,18 +262,15 @@ func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
 		return nil, fmt.Errorf("tokenauth: invalid legacy token claims")
 	}
 
-	// Check additional issuers if more than one is accepted.
-	if len(issuers) > 1 {
-		issuerOK := false
-		for _, iss := range issuers {
-			if lc.Issuer == iss {
-				issuerOK = true
-				break
-			}
+	issuerOK := false
+	for _, iss := range issuers {
+		if lc.Issuer == iss {
+			issuerOK = true
+			break
 		}
-		if !issuerOK {
-			return nil, fmt.Errorf("tokenauth: legacy token issuer %q not accepted", lc.Issuer)
-		}
+	}
+	if !issuerOK {
+		return nil, fmt.Errorf("tokenauth: legacy token issuer %q not accepted", lc.Issuer)
 	}
 
 	return &claims.Result{

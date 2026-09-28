@@ -289,6 +289,37 @@ func TestValidator_Legacy_FirstOfSeveralAudiences(t *testing.T) {
 	}
 }
 
+// TestValidator_Legacy_SecondOfSeveralIssuersAccepted is a regression test
+// for a Copilot-review finding on this PR: gojwt.WithIssuer only supports a
+// single exact issuer and enforces it inside ParseWithClaims itself, so
+// passing it as a parser option (checking only issuers[0]) hard-rejected any
+// token using an accepted issuer other than the first, before the manual
+// multi-issuer membership check ever ran. A token signed by the SECOND of
+// several configured legacy issuers must still validate successfully.
+func TestValidator_Legacy_SecondOfSeveralIssuersAccepted(t *testing.T) {
+	secret := []byte("test-hmac-secret-32-bytes-long!!")
+	ctx := context.Background()
+
+	v := New(Config{
+		Audiences: []string{"api"},
+		Legacy: LegacyConfig{
+			Enabled:    true,
+			HMACSecret: secret,
+			Issuers:    []string{"legacy-issuer-1", "legacy-issuer-2"},
+		},
+	})
+
+	raw := issueLegacyToken(t, secret, legacyTokenOpts{
+		jti:      "jti-legacy-second-issuer",
+		issuer:   "legacy-issuer-2",
+		audience: "api",
+	})
+
+	if _, err := v.Validate(ctx, raw); err != nil {
+		t.Fatalf("expected legacy token using the second-configured issuer to validate, got error: %v", err)
+	}
+}
+
 // TestValidator_Legacy_WrongIssuerRejected proves a legacy token with an
 // issuer outside the accepted set is rejected, and specifically that
 // Legacy.Issuers is actually consulted when only the shared top-level
