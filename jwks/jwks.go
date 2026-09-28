@@ -31,6 +31,18 @@ type Fetcher struct {
 	keySet    *jose.JSONWebKeySet
 	lastFetch time.Time
 	cancel    context.CancelFunc
+
+	// configuredTenantID is a static, operator-configured tenant identifier
+	// supplied once at construction time (from validator.Config.TenantID).
+	// Unlike a per-request tenant (see ContextWithTenantID), it is NOT
+	// derived from any unverified JWT claim, never mutates after
+	// construction, and so cannot leak between callers sharing this
+	// Fetcher. It exists solely as the X-Tenant-ID fallback for
+	// background-refresh fetches (Start's ticker), which run on the
+	// context passed to Start and so never carry a per-call tenant of
+	// their own; a real, per-call fetch always prefers ctx's tenant over
+	// this value.
+	configuredTenantID string
 }
 
 type tenantIDContextKey struct{}
@@ -43,7 +55,11 @@ func ContextWithTenantID(ctx context.Context, tenantID string) context.Context {
 // NewFetcher creates a JWKS fetcher for the given URL.
 // If refreshInterval is 0, defaults to 5 minutes.
 // If client is nil, http.DefaultClient is used.
-func NewFetcher(url string, refreshInterval time.Duration, client *http.Client) *Fetcher {
+// configuredTenantID, if non-empty, is a static, operator-configured tenant
+// identifier used as the X-Tenant-ID header for background-refresh fetches,
+// which have no per-call tenant of their own. Per-call fetches driven by a
+// real request (see ContextWithTenantID) always take precedence over it.
+func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, configuredTenantID string) *Fetcher {
 	if refreshInterval == 0 {
 		refreshInterval = 5 * time.Minute
 	}
@@ -51,9 +67,10 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client) 
 		client = http.DefaultClient
 	}
 	return &Fetcher{
-		url:     url,
-		refresh: refreshInterval,
-		client:  client,
+		url:                url,
+		refresh:            refreshInterval,
+		client:             client,
+		configuredTenantID: configuredTenantID,
 	}
 }
 
@@ -130,13 +147,19 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 		return fmt.Errorf("jwks: failed to create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	// The tenant ID comes from an unverified JWT claim (see
-	// issuerRequestTenantID in the validator package) and is derived fresh
-	// per call from ctx — it must never be persisted on the shared Fetcher,
-	// or one caller's unverified claim would leak into another caller's
-	// request that shares this Fetcher instance.
+	// A per-call tenant ID (see issuerRequestTenantID in the validator
+	// package) comes from an unverified JWT claim and is derived fresh per
+	// call from ctx — it must never be persisted on the shared Fetcher, or
+	// one caller's unverified claim would leak into another caller's
+	// request that shares this Fetcher instance. When no per-call tenant is
+	// present (background refresh via Start's ticker, which has no request
+	// of its own), fall back to the static, operator-configured
+	// configuredTenantID instead of sending no header or reusing a stale
+	// unverified value.
 	if tenantID, ok := ctx.Value(tenantIDContextKey{}).(string); ok && tenantID != "" {
 		req.Header.Set("X-Tenant-ID", tenantID)
+	} else if f.configuredTenantID != "" {
+		req.Header.Set("X-Tenant-ID", f.configuredTenantID)
 	}
 
 	resp, err := f.client.Do(req)

@@ -31,6 +31,15 @@ type Config struct {
 	// JWKSRefresh is the background refresh interval for JWKS keys. Default: 5m.
 	JWKSRefresh time.Duration
 
+	// TenantID is a static, operator-configured tenant identifier for this
+	// Validator's deployment. It is NOT derived from any JWT claim (unlike
+	// the per-request routing tenant extracted from an incoming token — see
+	// jwks.ContextWithTenantID) and is used only as the X-Tenant-ID fallback
+	// for the JWKS fetcher's background refresh, which has no per-call
+	// tenant of its own. Optional; leave empty if the JWKS endpoint isn't
+	// tenant-aware or this deployment is single-tenant.
+	TenantID string
+
 	// Issuer is the expected "iss" claim value.
 	Issuer string
 
@@ -73,7 +82,7 @@ func New(cfg Config) *Validator {
 
 	var fetcher *jwks.Fetcher
 	if cfg.JWKSURL != "" {
-		fetcher = jwks.NewFetcher(cfg.JWKSURL, cfg.JWKSRefresh, nil)
+		fetcher = jwks.NewFetcher(cfg.JWKSURL, cfg.JWKSRefresh, nil, cfg.TenantID)
 	}
 
 	return &Validator{

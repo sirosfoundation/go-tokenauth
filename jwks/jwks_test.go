@@ -75,7 +75,7 @@ func (r *tenantRecorder) all() []string {
 func TestFetcher_GetKey(t *testing.T) {
 	ts := testJWKSServer(t, nil)
 
-	f := NewFetcher(ts.URL, 0, nil)
+	f := NewFetcher(ts.URL, 0, nil, "")
 	ctx := context.Background()
 
 	keys, err := f.GetKey(ctx, "test-kid")
@@ -93,7 +93,7 @@ func TestFetcher_GetKey(t *testing.T) {
 func TestFetcher_GetKey_NotFound(t *testing.T) {
 	ts := testJWKSServer(t, nil)
 
-	f := NewFetcher(ts.URL, 0, nil)
+	f := NewFetcher(ts.URL, 0, nil, "")
 	ctx := context.Background()
 
 	_, err := f.GetKey(ctx, "nonexistent")
@@ -105,7 +105,7 @@ func TestFetcher_GetKey_NotFound(t *testing.T) {
 func TestFetcher_KeySet(t *testing.T) {
 	ts := testJWKSServer(t, nil)
 
-	f := NewFetcher(ts.URL, 0, nil)
+	f := NewFetcher(ts.URL, 0, nil, "")
 	ctx := context.Background()
 
 	// Before fetch, KeySet should be nil.
@@ -127,7 +127,7 @@ func TestFetcher_KeySet(t *testing.T) {
 func TestFetcher_Start(t *testing.T) {
 	ts := testJWKSServer(t, nil)
 
-	f := NewFetcher(ts.URL, 0, nil)
+	f := NewFetcher(ts.URL, 0, nil, "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -150,7 +150,7 @@ func TestFetcher_Start(t *testing.T) {
 func TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls(t *testing.T) {
 	tenants := &tenantRecorder{}
 	ts := testJWKSServer(t, tenants)
-	f := NewFetcher(ts.URL, 0, nil)
+	f := NewFetcher(ts.URL, 0, nil, "")
 
 	// A first call carries an unverified tenant_id claim for "tenant-1".
 	if err := f.fetch(ContextWithTenantID(context.Background(), "tenant-1")); err != nil {
@@ -183,6 +183,57 @@ func TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls(t *testing.T) {
 	}
 }
 
+// TestFetcher_Fetch_UsesConfiguredTenantForCallsWithoutOne is a regression
+// test for the fix to TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls's
+// original approach: removing the leaky per-request tenantID field also
+// removed ANY tenant header from background-refresh fetches (Start's
+// ticker calls fetch with the plain context passed to Start, which never
+// carries a per-call tenant). Against a tenant-aware JWKS endpoint, sending
+// no header there could resolve to a default/wrong tenant and silently
+// populate the shared, tenant-unpartitioned key cache with the wrong keys.
+//
+// The fix is a static, operator-configured fallback (NewFetcher's
+// configuredTenantID / validator.Config.TenantID) — NOT derived from any
+// request, so it can't leak the way the old removed field did — used only
+// when a fetch's ctx carries no per-call tenant. This proves: (a) a
+// tenant-less call (simulating background refresh) uses the configured
+// fallback, and (b) a call with its own per-call tenant still uses that,
+// never the configured fallback.
+func TestFetcher_Fetch_UsesConfiguredTenantForCallsWithoutOne(t *testing.T) {
+	tenants := &tenantRecorder{}
+	ts := testJWKSServer(t, tenants)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+
+	// Simulates a background-refresh fetch: no per-call tenant in ctx.
+	if err := f.fetch(context.Background()); err != nil {
+		t.Fatalf("first fetch failed: %v", err)
+	}
+	// A real, per-call request's tenant always wins over the configured
+	// fallback.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "request-tenant")); err != nil {
+		t.Fatalf("second fetch failed: %v", err)
+	}
+	// Another tenant-less call again falls back to the configured tenant,
+	// not whatever the previous per-call request happened to use.
+	if err := f.fetch(context.Background()); err != nil {
+		t.Fatalf("third fetch failed: %v", err)
+	}
+
+	headers := tenants.all()
+	if len(headers) != 3 {
+		t.Fatalf("expected 3 requests, got %d", len(headers))
+	}
+	if headers[0] != "configured-tenant" {
+		t.Fatalf("expected first (tenant-less) request to use configured fallback, got %q", headers[0])
+	}
+	if headers[1] != "request-tenant" {
+		t.Fatalf("expected second request to use its own per-call tenant, got %q", headers[1])
+	}
+	if headers[2] != "configured-tenant" {
+		t.Fatalf("expected third (tenant-less) request to use configured fallback again, not %q left over from the previous call", headers[2])
+	}
+}
+
 // TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState exercises the same
 // shared-Fetcher-across-callers scenario as
 // TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls but with genuinely
@@ -195,7 +246,7 @@ func TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls(t *testing.T) {
 func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
 	tenants := &tenantRecorder{}
 	ts := testJWKSServer(t, tenants)
-	f := NewFetcher(ts.URL, 0, nil)
+	f := NewFetcher(ts.URL, 0, nil, "")
 
 	const n = 20
 	var wg sync.WaitGroup
