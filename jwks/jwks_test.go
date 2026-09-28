@@ -15,7 +15,9 @@ import (
 	"github.com/go-jose/go-jose/v4"
 )
 
-func testJWKSServer(t *testing.T) (*httptest.Server, *ecdsa.PrivateKey) {
+// testKeySet builds a single-key JWKS for use as a test server's response
+// body.
+func testKeySet(t *testing.T) jose.JSONWebKeySet {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -28,18 +30,50 @@ func testJWKSServer(t *testing.T) (*httptest.Server, *ecdsa.PrivateKey) {
 		Algorithm: string(jose.ES256),
 		Use:       "sig",
 	}
-	ks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+	return jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+}
+
+// testJWKSServer starts a JWKS server backed by a single test key. tenants,
+// if non-nil, records the X-Tenant-ID header seen on every request in
+// arrival order (safe for concurrent use).
+func testJWKSServer(t *testing.T, tenants *tenantRecorder) *httptest.Server {
+	t.Helper()
+	ks := testKeySet(t)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tenants != nil {
+			tenants.record(r.Header.Get("X-Tenant-ID"))
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ks)
 	}))
 	t.Cleanup(ts.Close)
-	return ts, key
+	return ts
+}
+
+// tenantRecorder collects X-Tenant-ID header values observed by a test
+// server, safe for concurrent use by multiple in-flight requests.
+type tenantRecorder struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (r *tenantRecorder) record(tenant string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, tenant)
+}
+
+func (r *tenantRecorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.seen))
+	copy(out, r.seen)
+	return out
 }
 
 func TestFetcher_GetKey(t *testing.T) {
-	ts, _ := testJWKSServer(t)
+	ts := testJWKSServer(t, nil)
 
 	f := NewFetcher(ts.URL, 0, nil)
 	ctx := context.Background()
@@ -57,7 +91,7 @@ func TestFetcher_GetKey(t *testing.T) {
 }
 
 func TestFetcher_GetKey_NotFound(t *testing.T) {
-	ts, _ := testJWKSServer(t)
+	ts := testJWKSServer(t, nil)
 
 	f := NewFetcher(ts.URL, 0, nil)
 	ctx := context.Background()
@@ -69,7 +103,7 @@ func TestFetcher_GetKey_NotFound(t *testing.T) {
 }
 
 func TestFetcher_KeySet(t *testing.T) {
-	ts, _ := testJWKSServer(t)
+	ts := testJWKSServer(t, nil)
 
 	f := NewFetcher(ts.URL, 0, nil)
 	ctx := context.Background()
@@ -91,7 +125,7 @@ func TestFetcher_KeySet(t *testing.T) {
 }
 
 func TestFetcher_Start(t *testing.T) {
-	ts, _ := testJWKSServer(t)
+	ts := testJWKSServer(t, nil)
 
 	f := NewFetcher(ts.URL, 0, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,33 +141,15 @@ func TestFetcher_Start(t *testing.T) {
 	}
 }
 
+// TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls is a regression test for a
+// tenant-claim leak: the Fetcher used to persist the unverified tenant_id
+// claim from whichever call it validated most recently, and reused it as a
+// fallback X-Tenant-ID header for later, unrelated calls sharing the same
+// Fetcher instance. It proves that a call with no tenant in its context
+// never inherits one from an earlier, unrelated call.
 func TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls(t *testing.T) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	jwk := jose.JSONWebKey{
-		Key:       key.Public(),
-		KeyID:     "test-kid",
-		Algorithm: string(jose.ES256),
-		Use:       "sig",
-	}
-	ks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
-
-	var (
-		mu      sync.Mutex
-		headers []string
-	)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		headers = append(headers, r.Header.Get("X-Tenant-ID"))
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ks)
-	}))
-	t.Cleanup(ts.Close)
-
+	tenants := &tenantRecorder{}
+	ts := testJWKSServer(t, tenants)
 	f := NewFetcher(ts.URL, 0, nil)
 
 	// A first call carries an unverified tenant_id claim for "tenant-1".
@@ -152,8 +168,7 @@ func TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls(t *testing.T) {
 		t.Fatalf("third fetch failed: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	headers := tenants.all()
 	if len(headers) != 3 {
 		t.Fatalf("expected 3 requests, got %d", len(headers))
 	}
@@ -178,32 +193,8 @@ func TestFetcher_Fetch_DoesNotLeakTenantAcrossCalls(t *testing.T) {
 // observe (or cause another to observe) a tenant it didn't provide itself.
 // Run with -race to also catch any reintroduced mutable shared state.
 func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	jwk := jose.JSONWebKey{
-		Key:       key.Public(),
-		KeyID:     "test-kid",
-		Algorithm: string(jose.ES256),
-		Use:       "sig",
-	}
-	ks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
-
-	var (
-		mu      sync.Mutex
-		headers []string
-	)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		headers = append(headers, r.Header.Get("X-Tenant-ID"))
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ks)
-	}))
-	t.Cleanup(ts.Close)
-
+	tenants := &tenantRecorder{}
+	ts := testJWKSServer(t, tenants)
 	f := NewFetcher(ts.URL, 0, nil)
 
 	const n = 20
@@ -238,8 +229,7 @@ func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
 		t.Error(err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	headers := tenants.all()
 	if len(headers) != n {
 		t.Fatalf("expected %d requests, got %d", n, len(headers))
 	}

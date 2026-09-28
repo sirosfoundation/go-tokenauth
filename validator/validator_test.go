@@ -18,19 +18,26 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/claims"
 )
 
-func setupASServer(t *testing.T) (*httptest.Server, *ecdsa.PrivateKey, string) {
+// newTestSigningKey generates an ECDSA key and wraps its public half in a
+// JWK, for use in JWKS test servers below.
+func newTestSigningKey(t *testing.T) (*ecdsa.PrivateKey, gojose.JSONWebKey) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	jwk := gojose.JSONWebKey{
 		Key:       key.Public(),
 		KeyID:     "test-kid",
 		Algorithm: string(gojose.ES256),
 		Use:       "sig",
 	}
+	return key, jwk
+}
+
+func setupASServer(t *testing.T) (*httptest.Server, *ecdsa.PrivateKey, string) {
+	t.Helper()
+	key, jwk := newTestSigningKey(t)
 	ks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +45,25 @@ func setupASServer(t *testing.T) (*httptest.Server, *ecdsa.PrivateKey, string) {
 		_ = json.NewEncoder(w).Encode(ks)
 	}))
 	t.Cleanup(ts.Close)
-	return ts, key, "test-kid"
+	return ts, key, jwk.KeyID
+}
+
+// setupASServerWithTenantCapture is like setupASServer but also records the
+// X-Tenant-ID header of the most recent JWKS request into seenTenant, for
+// tests that check the routing-tenant behavior.
+func setupASServerWithTenantCapture(t *testing.T) (ts *httptest.Server, key *ecdsa.PrivateKey, kid string, seenTenant *string) {
+	t.Helper()
+	key, jwk := newTestSigningKey(t)
+	ks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
+	seenTenant = new(string)
+
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*seenTenant = r.Header.Get("X-Tenant-ID")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+	return ts, key, jwk.KeyID, seenTenant
 }
 
 func issueTestToken(t *testing.T, key *ecdsa.PrivateKey, kid, issuer, audience, tenantID string, tac claims.TAC) string {
@@ -83,6 +108,44 @@ func issueTestTokenWithRoutingTenant(t *testing.T, key *ecdsa.PrivateKey, kid, i
 		t.Fatal(err)
 	}
 	return token
+}
+
+// legacyTokenOpts configures issueLegacyToken. Subject and UserID default to
+// "user-1" when unset.
+type legacyTokenOpts struct {
+	jti      string
+	issuer   string
+	audience string
+	did      string
+	tenantID string
+}
+
+// issueLegacyToken signs a legacy HMAC token with the given secret and
+// claims, cutting down on the boilerplate repeated across the legacy
+// validation tests below.
+func issueLegacyToken(t *testing.T, secret []byte, opts legacyTokenOpts) string {
+	t.Helper()
+	now := time.Now()
+	lc := &LegacyTokenClaims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ID:        opts.jti,
+			Issuer:    opts.issuer,
+			Subject:   "user-1",
+			Audience:  gojwt.ClaimStrings{opts.audience},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
+		},
+		UserID:   "user-1",
+		DID:      opts.did,
+		TenantID: opts.tenantID,
+	}
+
+	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
+	raw, err := token.SignedString(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func TestValidator_Asymmetric_Success(t *testing.T) {
@@ -211,24 +274,11 @@ func TestValidator_Legacy_FirstOfSeveralAudiences(t *testing.T) {
 		},
 	})
 
-	now := time.Now()
-	lc := &LegacyTokenClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			ID:        "jti-legacy-first-aud",
-			Issuer:    "legacy-issuer",
-			Subject:   "user-1",
-			Audience:  gojwt.ClaimStrings{"first-api"},
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
-		},
-		UserID: "user-1",
-	}
-
-	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
-	raw, err := token.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := issueLegacyToken(t, secret, legacyTokenOpts{
+		jti:      "jti-legacy-first-aud",
+		issuer:   "legacy-issuer",
+		audience: "first-api",
+	})
 
 	result, err := v.Validate(ctx, raw)
 	if err != nil {
@@ -257,24 +307,11 @@ func TestValidator_Legacy_WrongIssuerRejected(t *testing.T) {
 		},
 	})
 
-	now := time.Now()
-	lc := &LegacyTokenClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			ID:        "jti-legacy-bad-iss",
-			Issuer:    "attacker-issuer",
-			Subject:   "user-1",
-			Audience:  gojwt.ClaimStrings{"api"},
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
-		},
-		UserID: "user-1",
-	}
-
-	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
-	raw, err := token.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := issueLegacyToken(t, secret, legacyTokenOpts{
+		jti:      "jti-legacy-bad-iss",
+		issuer:   "attacker-issuer",
+		audience: "api",
+	})
 
 	if _, err := v.Validate(ctx, raw); err == nil {
 		t.Error("expected error for legacy token with unaccepted issuer")
@@ -301,43 +338,20 @@ func TestValidator_Legacy_IssuerFallsBackToSharedIssuer(t *testing.T) {
 		},
 	})
 
-	now := time.Now()
-	badIssuer := &LegacyTokenClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			ID:        "jti-legacy-fallback-bad",
-			Issuer:    "attacker-issuer",
-			Subject:   "user-1",
-			Audience:  gojwt.ClaimStrings{"api"},
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
-		},
-		UserID: "user-1",
-	}
-	badToken := gojwt.NewWithClaims(gojwt.SigningMethodHS256, badIssuer)
-	rawBad, err := badToken.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rawBad := issueLegacyToken(t, secret, legacyTokenOpts{
+		jti:      "jti-legacy-fallback-bad",
+		issuer:   "attacker-issuer",
+		audience: "api",
+	})
 	if _, err := v.Validate(ctx, rawBad); err == nil {
 		t.Error("expected error for legacy token whose issuer doesn't match the shared Config.Issuer fallback")
 	}
 
-	goodIssuer := &LegacyTokenClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			ID:        "jti-legacy-fallback-good",
-			Issuer:    "shared-issuer",
-			Subject:   "user-1",
-			Audience:  gojwt.ClaimStrings{"api"},
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
-		},
-		UserID: "user-1",
-	}
-	goodToken := gojwt.NewWithClaims(gojwt.SigningMethodHS256, goodIssuer)
-	rawGood, err := goodToken.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rawGood := issueLegacyToken(t, secret, legacyTokenOpts{
+		jti:      "jti-legacy-fallback-good",
+		issuer:   "shared-issuer",
+		audience: "api",
+	})
 	if _, err := v.Validate(ctx, rawGood); err != nil {
 		t.Fatalf("expected legacy token matching the shared Config.Issuer fallback to validate, got: %v", err)
 	}
@@ -381,23 +395,11 @@ func TestValidator_Legacy_EmptyAudiencesIsConfigError(t *testing.T) {
 		},
 	})
 
-	now := time.Now()
-	lc := &LegacyTokenClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			ID:        "jti-legacy-no-aud-cfg",
-			Issuer:    "legacy-issuer",
-			Subject:   "user-1",
-			Audience:  gojwt.ClaimStrings{"anything-goes"},
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
-		},
-		UserID: "user-1",
-	}
-	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
-	raw, err := token.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := issueLegacyToken(t, secret, legacyTokenOpts{
+		jti:      "jti-legacy-no-aud-cfg",
+		issuer:   "legacy-issuer",
+		audience: "anything-goes",
+	})
 
 	if _, err := v.Validate(ctx, raw); err == nil {
 		t.Error("expected error when no audiences are configured, got nil (fail-open)")
@@ -418,26 +420,13 @@ func TestValidator_Legacy_Success(t *testing.T) {
 		},
 	})
 
-	now := time.Now()
-	lc := &LegacyTokenClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			ID:        "jti-legacy",
-			Issuer:    "legacy-issuer",
-			Subject:   "user-1",
-			Audience:  gojwt.ClaimStrings{"api"},
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ExpiresAt: gojwt.NewNumericDate(now.Add(time.Hour)),
-		},
-		UserID:   "user-1",
-		DID:      "did:example:123",
-		TenantID: "tenant-1",
-	}
-
-	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, lc)
-	raw, err := token.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := issueLegacyToken(t, secret, legacyTokenOpts{
+		jti:      "jti-legacy",
+		issuer:   "legacy-issuer",
+		audience: "api",
+		did:      "did:example:123",
+		tenantID: "tenant-1",
+	})
 
 	result, err := v.Validate(ctx, raw)
 	if err != nil {
@@ -517,26 +506,7 @@ func TestValidator_Asymmetric_Revoked(t *testing.T) {
 }
 
 func TestValidator_Asymmetric_SendsTenantHeaderForIssuerRequests(t *testing.T) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	jwk := gojose.JSONWebKey{
-		Key:       key.Public(),
-		KeyID:     "test-kid",
-		Algorithm: string(gojose.ES256),
-		Use:       "sig",
-	}
-	ks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
-
-	var seenTenant string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenTenant = r.Header.Get("X-Tenant-ID")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ks)
-	}))
-	t.Cleanup(ts.Close)
+	ts, key, kid, seenTenant := setupASServerWithTenantCapture(t)
 
 	v := New(Config{
 		JWKSURL:   ts.URL,
@@ -544,36 +514,17 @@ func TestValidator_Asymmetric_SendsTenantHeaderForIssuerRequests(t *testing.T) {
 		Audiences: []string{"api"},
 	})
 
-	token := issueTestTokenWithRoutingTenant(t, key, "test-kid", "test-issuer", "api", "tenant-id-1", "tenant-1", claims.TAC("rl"))
+	token := issueTestTokenWithRoutingTenant(t, key, kid, "test-issuer", "api", "tenant-id-1", "tenant-1", claims.TAC("rl"))
 	if _, err := v.Validate(context.Background(), token); err != nil {
 		t.Fatalf("Validate failed: %v", err)
 	}
-	if seenTenant != "tenant-1" {
-		t.Fatalf("expected X-Tenant-ID tenant-1, got %q", seenTenant)
+	if *seenTenant != "tenant-1" {
+		t.Fatalf("expected X-Tenant-ID tenant-1, got %q", *seenTenant)
 	}
 }
 
 func TestValidator_Asymmetric_IgnoresInvalidRoutingTenant(t *testing.T) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	jwk := gojose.JSONWebKey{
-		Key:       key.Public(),
-		KeyID:     "test-kid",
-		Algorithm: string(gojose.ES256),
-		Use:       "sig",
-	}
-	ks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
-
-	var seenTenant string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenTenant = r.Header.Get("X-Tenant-ID")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ks)
-	}))
-	t.Cleanup(ts.Close)
+	ts, key, kid, seenTenant := setupASServerWithTenantCapture(t)
 
 	v := New(Config{
 		JWKSURL:   ts.URL,
@@ -581,11 +532,11 @@ func TestValidator_Asymmetric_IgnoresInvalidRoutingTenant(t *testing.T) {
 		Audiences: []string{"api"},
 	})
 
-	token := issueTestTokenWithRoutingTenant(t, key, "test-kid", "test-issuer", "api", "tenant-1", "Tenant_1", claims.TAC("rl"))
+	token := issueTestTokenWithRoutingTenant(t, key, kid, "test-issuer", "api", "tenant-1", "Tenant_1", claims.TAC("rl"))
 	if _, err := v.Validate(context.Background(), token); err != nil {
 		t.Fatalf("Validate failed: %v", err)
 	}
-	if seenTenant != "" {
-		t.Fatalf("expected no X-Tenant-ID header for invalid tenant, got %q", seenTenant)
+	if *seenTenant != "" {
+		t.Fatalf("expected no X-Tenant-ID header for invalid tenant, got %q", *seenTenant)
 	}
 }
