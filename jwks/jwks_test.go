@@ -547,3 +547,71 @@ func TestFetcher_Fetch_ConfiguredTenantExemptFromEvictionAndAdmissionLimit(t *te
 		t.Errorf("expected the configured tenant to remain exempt from the new-tenant admission limit, got: %v", err)
 	}
 }
+
+// TestFetcher_Fetch_SpoofedTenantClaimNotExemptFromAdmissionLimit is a
+// regression test for a Copilot-review finding: admitNewTenant used to
+// exempt any request whose resolved tenant string equaled
+// configuredTenantID, but that string is exactly what an unverified
+// per-call claim can also carry — an attacker sending tenant/tenant_id
+// equal to the (guessed or known) configured value got the same free pass
+// as a genuine background-refresh call, bypassing the limiter entirely. It
+// proves an explicit claim matching the configured tenant string is
+// refused under a limit of 0, while the genuine fallback path (no per-call
+// tenant at all) remains exempt under the same setting.
+func TestFetcher_Fetch_SpoofedTenantClaimNotExemptFromAdmissionLimit(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.admissionLimit = 0 // refuse every non-fallback admission outright
+	f.admissionWindow = time.Hour
+
+	spoofedCtx := ContextWithTenantID(context.Background(), "configured-tenant")
+	if err := f.fetch(spoofedCtx); err == nil {
+		t.Error("expected an explicit claim matching the configured tenant string to be subject to the admission limit, not exempt")
+	}
+
+	if err := f.fetch(context.Background()); err != nil {
+		t.Errorf("expected the genuine fallback path (no per-call tenant) to remain exempt from the admission limit, got: %v", err)
+	}
+}
+
+// TestFetcher_Fetch_SpoofedTenantClaimDoesNotGetEvictionProtection is the
+// eviction-side counterpart of the admission-bypass regression test above:
+// it proves a cache slot is marked eviction-protected only when it was
+// actually created by a genuine fallback-path fetch, never merely because
+// its tenant string happens to equal the configured tenant. It simulates
+// the worst case — an attacker's spoofed claim reaching the fetcher
+// *before* any genuine background refresh ever does — and confirms the
+// resulting entry is still evicted like any other once capacity is
+// exceeded.
+func TestFetcher_Fetch_SpoofedTenantClaimDoesNotGetEvictionProtection(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.cacheCapacity = 2
+	f.admissionLimit = 10
+	f.admissionWindow = time.Hour
+
+	// An attacker's explicit claim reaches the fetcher first, with a
+	// string value that happens to match the operator's configured
+	// tenant — no genuine fallback fetch has happened yet.
+	spoofedCtx := ContextWithTenantID(context.Background(), "configured-tenant")
+	if err := f.fetch(spoofedCtx); err != nil {
+		t.Fatalf("spoofed fetch failed: %v", err)
+	}
+
+	// Fill the rest of the small cache with unrelated tenants to force
+	// eviction pressure once capacity is exceeded.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "other-tenant")); err != nil {
+		t.Fatalf("other-tenant fetch failed: %v", err)
+	}
+	if err := f.fetch(ContextWithTenantID(context.Background(), "third-tenant")); err != nil {
+		t.Fatalf("third-tenant fetch failed: %v", err)
+	}
+
+	// The spoofed entry was never created via the genuine fallback path,
+	// so it must be evictable like any other non-protected entry — not
+	// treated as protected merely because its string matches
+	// configuredTenantID.
+	if ks := f.KeySet("configured-tenant"); ks != nil {
+		t.Error("expected the spoofed entry (created by an explicit claim, not the fallback path) to be evictable, but it survived as if protected")
+	}
+}

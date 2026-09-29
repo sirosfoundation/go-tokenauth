@@ -136,53 +136,64 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 	}
 }
 
-// protectedTenant returns the one tenant slot that is exempt from LRU
-// eviction and from the new-tenant fetch rate limiter: the
-// operator-configured tenant if one was set at construction, otherwise the
-// untenanted default slot (""). Both represent legitimate, static
-// configuration rather than attacker-controlled input, so churn from other
-// (attacker-influenced) tenants must never starve or evict it.
-func (f *Fetcher) protectedTenant() string {
-	return f.configuredTenantID
+// tenantLRUEntry is the value stored in each Fetcher.lru node. protected is
+// set only when the entry was created by a fetch whose tenant came from
+// the static fallback path (viaFallback — see tenantForContext), never by
+// an explicit per-call claim. Once set, it is never recomputed by a later
+// touchTenantLocked call for the same tenant string (that call just moves
+// the existing node to the front), so an attacker sending an explicit
+// claim that happens to equal the configured tenant's string cannot
+// manufacture eviction-protected status for it: only a genuine
+// fallback-driven fetch (background refresh, or any call whose ctx simply
+// carries no per-call tenant) ever sets protected to true in the first
+// place.
+type tenantLRUEntry struct {
+	tenant    string
+	protected bool
 }
 
 // touchTenantLocked records tenant as the most-recently-fetched entry,
 // evicting the least-recently-fetched non-protected tenant's cache slot
 // first if tenant is new and the cache is already at cacheCapacity. Caller
 // must hold f.mu (write lock).
-func (f *Fetcher) touchTenantLocked(tenant string) {
+func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) {
 	if el, ok := f.lruElems[tenant]; ok {
 		f.lru.MoveToFront(el)
 		return
 	}
 	if f.lru.Len() >= f.cacheCapacity {
-		protected := f.protectedTenant()
 		for oldest := f.lru.Back(); oldest != nil; oldest = oldest.Prev() {
-			oldTenant, _ := oldest.Value.(string) // always a string: only touchTenantLocked pushes onto lru
-			if oldTenant == protected {
-				continue // never evict the operator-configured/default slot
+			entry, _ := oldest.Value.(tenantLRUEntry) // always this type: only touchTenantLocked pushes onto lru
+			if entry.protected {
+				continue // never evict a slot created via the static fallback path
 			}
 			f.lru.Remove(oldest)
-			delete(f.lruElems, oldTenant)
-			delete(f.keySets, oldTenant)
+			delete(f.lruElems, entry.tenant)
+			delete(f.keySets, entry.tenant)
 			break
 		}
-		// If every existing entry is the protected tenant (only possible
-		// with cacheCapacity == 1), nothing is evicted and the cache
-		// simply grows by one rather than evicting protected state.
+		// If every existing entry is protected (only possible with
+		// cacheCapacity == 1 and a configured tenant), nothing is evicted
+		// and the cache simply grows by one rather than evicting
+		// protected state.
 	}
-	f.lruElems[tenant] = f.lru.PushFront(tenant)
+	f.lruElems[tenant] = f.lru.PushFront(tenantLRUEntry{tenant: tenant, protected: viaFallback})
 }
 
-// admitNewTenant reports whether ctx's tenant may trigger an outbound JWKS
-// fetch right now. The protected tenant (see protectedTenant) and any
-// tenant already present in the cache always are; any other tenant is
-// subject to admissionLimit/admissionWindow, so an attacker cycling
-// through many distinct unverified tenant claims cannot generate unbounded
-// outbound requests to the JWKS endpoint or repeatedly evict legitimate
-// cache entries by forcing constant churn.
-func (f *Fetcher) admitNewTenant(tenant string) bool {
-	if tenant == f.protectedTenant() {
+// admitNewTenant reports whether a fetch for tenant may proceed right now.
+// viaFallback (see tenantForContext) — not a string match against the
+// configured tenant — is what exempts a call from the limiter: an
+// unverified per-call claim that merely happens to equal the configured
+// tenant's string is still subject to the same admission rules as any
+// other explicit claim, so an attacker cannot bypass the limiter by
+// guessing or copying that value. Any tenant already present in the cache
+// is also exempt (it isn't "new"); every other tenant is subject to
+// admissionLimit/admissionWindow, so an attacker cycling through many
+// distinct unverified tenant claims cannot generate unbounded outbound
+// requests to the JWKS endpoint or repeatedly evict legitimate cache
+// entries by forcing constant churn.
+func (f *Fetcher) admitNewTenant(tenant string, viaFallback bool) bool {
+	if viaFallback {
 		return true
 	}
 
@@ -212,11 +223,19 @@ func (f *Fetcher) admitNewTenant(tenant string) bool {
 // tenant from ctx if present, otherwise the static, operator-configured
 // fallback, otherwise "" (the untenanted default slot). fetch and GetKey
 // both call this so they always agree on which tenant a given call is for.
-func (f *Fetcher) tenantForContext(ctx context.Context) string {
+//
+// viaFallback reports whether tenant came from the static fallback
+// (configuredTenantID, or "" if unset) because ctx carried no per-call
+// tenant at all — never because an explicit per-call claim happened to
+// equal that same string. This distinction matters: only the fallback
+// path is trusted, operator-configured provenance (see admitNewTenant and
+// touchTenantLocked's protected flag); an attacker's own claim must never
+// be able to buy the same trust merely by matching its value.
+func (f *Fetcher) tenantForContext(ctx context.Context) (tenant string, viaFallback bool) {
 	if tenantID, ok := ctx.Value(tenantIDContextKey{}).(string); ok && tenantID != "" {
-		return tenantID
+		return tenantID, false
 	}
-	return f.configuredTenantID
+	return f.configuredTenantID, true
 }
 
 // Start begins background key refresh. Call Stop() to clean up.
@@ -262,7 +281,7 @@ func (f *Fetcher) KeySet(tenant string) *jose.JSONWebKeySet {
 // (handles key rotation race). A cache hit for one tenant is never
 // returned for a lookup resolving to a different tenant.
 func (f *Fetcher) GetKey(ctx context.Context, kid string) ([]jose.JSONWebKey, error) {
-	tenant := f.tenantForContext(ctx)
+	tenant, _ := f.tenantForContext(ctx)
 
 	f.mu.RLock()
 	ks := f.keySets[tenant]
@@ -299,9 +318,9 @@ func (f *Fetcher) GetKey(ctx context.Context, kid string) ([]jose.JSONWebKey, er
 // cache slot for ctx's effective tenant (see tenantForContext) — never in
 // a single shared slot that a different tenant's lookup could also read.
 func (f *Fetcher) fetch(ctx context.Context) error {
-	tenant := f.tenantForContext(ctx)
+	tenant, viaFallback := f.tenantForContext(ctx)
 
-	if !f.admitNewTenant(tenant) {
+	if !f.admitNewTenant(tenant, viaFallback) {
 		return fmt.Errorf("jwks: too many distinct tenants requested keys recently; refusing to fetch for %q", tenant)
 	}
 
@@ -337,7 +356,7 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
-	f.touchTenantLocked(tenant)
+	f.touchTenantLocked(tenant, viaFallback)
 	f.keySets[tenant] = &ks
 	f.lastFetch = time.Now()
 	f.mu.Unlock()
