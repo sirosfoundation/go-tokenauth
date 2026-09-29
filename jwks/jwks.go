@@ -44,6 +44,20 @@ const (
 	newTenantFetchWindow         = time.Second
 )
 
+// defaultMinFetchInterval bounds how often a fetch may be re-attempted for
+// the SAME tenant slot, independent of admission/eviction exemptions (see
+// touchTenantLocked). admitNewTenant only gates a tenant's first-ever (or
+// evicted-and-returning) admission; it says nothing about how often a
+// GetKey cache miss re-triggers a fetch for a tenant that's already
+// admitted (cached, or the fallback/protected slot). The JWT's kid header
+// is itself unverified and attacker-controlled, so an attacker who already
+// has (or is exempt from) tenant admission can still send arbitrarily many
+// distinct, nonexistent kid values to force a fresh outbound fetch on
+// every single request. This cooldown bounds that independently of any
+// exemption: no tenant slot, including the protected/fallback one, may be
+// refetched more than once per defaultMinFetchInterval.
+const defaultMinFetchInterval = time.Second
+
 // Fetcher maintains cached copies of JWKS keys from a remote endpoint,
 // partitioned per tenant.
 //
@@ -73,8 +87,11 @@ type Fetcher struct {
 	// cacheCapacity defaults to maxCachedTenants; only overridden by tests
 	// to exercise eviction without a large number of fetches.
 	cacheCapacity int
-	lastFetch     time.Time
-	cancel        context.CancelFunc
+	// minFetchInterval defaults to defaultMinFetchInterval; only overridden
+	// by tests to exercise throttling deterministically and quickly.
+	minFetchInterval time.Duration
+	lastFetch        time.Time
+	cancel           context.CancelFunc
 
 	// configuredTenantID is a static, operator-configured tenant identifier
 	// supplied once at construction time (from validator.Config.TenantID).
@@ -130,42 +147,66 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 		lru:                list.New(),
 		lruElems:           make(map[string]*list.Element),
 		cacheCapacity:      maxCachedTenants,
+		minFetchInterval:   defaultMinFetchInterval,
 		configuredTenantID: configuredTenantID,
 		admissionLimit:     maxNewTenantFetchesPerWindow,
 		admissionWindow:    newTenantFetchWindow,
 	}
 }
 
-// tenantLRUEntry is the value stored in each Fetcher.lru node. protected is
-// set only when the entry was created by a fetch whose tenant came from
-// the static fallback path (viaFallback — see tenantForContext), never by
-// an explicit per-call claim. Once set, it is never recomputed by a later
-// touchTenantLocked call for the same tenant string (that call just moves
-// the existing node to the front), so an attacker sending an explicit
-// claim that happens to equal the configured tenant's string cannot
-// manufacture eviction-protected status for it: only a genuine
-// fallback-driven fetch (background refresh, or any call whose ctx simply
-// carries no per-call tenant) ever sets protected to true in the first
-// place.
+// tenantLRUEntry is the value stored in each Fetcher.lru node.
+//
+// protected starts false unless the entry is FIRST created by a fetch
+// whose tenant came from the static fallback path (viaFallback — see
+// tenantForContext), never by an explicit per-call claim, so an attacker
+// sending an explicit claim that happens to equal the configured tenant's
+// string cannot manufacture eviction-protected status merely by creating
+// the slot first. A later touchTenantLocked call for the SAME tenant
+// string does upgrade protected to true if THAT call is itself
+// viaFallback — so a slot an attacker's spoofed claim created first still
+// ends up correctly protected once a genuine fallback fetch subsequently
+// claims the same tenant string. protected is never downgraded once set.
+//
+// lastAttempt records when a fetch was last attempted for this tenant
+// (successful or not), enforcing minFetchInterval between attempts
+// regardless of protected/admission status — see defaultMinFetchInterval.
 type tenantLRUEntry struct {
-	tenant    string
-	protected bool
+	tenant      string
+	protected   bool
+	lastAttempt time.Time
 }
 
-// touchTenantLocked records tenant as the most-recently-fetched entry,
-// evicting the least-recently-fetched non-protected tenant's cache slot
-// first if tenant is new and the cache is already at cacheCapacity. Caller
-// must hold f.mu (write lock).
-func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) {
+// touchTenantLocked records an attempt to fetch tenant right now. For an
+// existing entry it enforces minFetchInterval since that tenant's last
+// attempt (returning false, without updating anything, if attempted too
+// soon) and upgrades protected to true if this attempt is viaFallback. For
+// a brand-new tenant it creates the entry (lastAttempt = now, protected =
+// viaFallback), evicting the least-recently-attempted non-protected entry
+// first if the cache is already at cacheCapacity. Caller must hold f.mu
+// (write lock). The returned bool reports whether the attempt may proceed
+// to the network; fetch must not do so if it returns false.
+func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) bool {
+	now := time.Now()
+
 	if el, ok := f.lruElems[tenant]; ok {
+		entry, _ := el.Value.(tenantLRUEntry) // always this type: only touchTenantLocked pushes onto lru
+		if now.Sub(entry.lastAttempt) < f.minFetchInterval {
+			return false
+		}
+		entry.lastAttempt = now
+		if viaFallback {
+			entry.protected = true
+		}
+		el.Value = entry
 		f.lru.MoveToFront(el)
-		return
+		return true
 	}
+
 	if f.lru.Len() >= f.cacheCapacity {
 		for oldest := f.lru.Back(); oldest != nil; oldest = oldest.Prev() {
-			entry, _ := oldest.Value.(tenantLRUEntry) // always this type: only touchTenantLocked pushes onto lru
+			entry, _ := oldest.Value.(tenantLRUEntry)
 			if entry.protected {
-				continue // never evict a slot created via the static fallback path
+				continue // never evict a slot protected by a genuine fallback fetch
 			}
 			f.lru.Remove(oldest)
 			delete(f.lruElems, entry.tenant)
@@ -177,7 +218,8 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) {
 		// and the cache simply grows by one rather than evicting
 		// protected state.
 	}
-	f.lruElems[tenant] = f.lru.PushFront(tenantLRUEntry{tenant: tenant, protected: viaFallback})
+	f.lruElems[tenant] = f.lru.PushFront(tenantLRUEntry{tenant: tenant, protected: viaFallback, lastAttempt: now})
+	return true
 }
 
 // admitNewTenant reports whether a fetch for tenant may proceed right now.
@@ -324,6 +366,18 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 		return fmt.Errorf("jwks: too many distinct tenants requested keys recently; refusing to fetch for %q", tenant)
 	}
 
+	// touchTenantLocked's minFetchInterval cooldown applies here,
+	// regardless of the admission-control exemption above: it bounds how
+	// often THIS tenant slot may be refetched at all, independent of
+	// tenant identity/cardinality — see defaultMinFetchInterval for why
+	// that's a separate axis of protection from admitNewTenant.
+	f.mu.Lock()
+	allowed := f.touchTenantLocked(tenant, viaFallback)
+	f.mu.Unlock()
+	if !allowed {
+		return fmt.Errorf("jwks: refetch for tenant %q attempted too soon; refusing (minimum interval %s)", tenant, f.minFetchInterval)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
 		return fmt.Errorf("jwks: failed to create request: %w", err)
@@ -356,7 +410,6 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
-	f.touchTenantLocked(tenant, viaFallback)
 	f.keySets[tenant] = &ks
 	f.lastFetch = time.Now()
 	f.mu.Unlock()

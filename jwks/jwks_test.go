@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -204,6 +205,11 @@ func TestFetcher_Fetch_UsesConfiguredTenantForCallsWithoutOne(t *testing.T) {
 	tenants := &tenantRecorder{}
 	ts := testJWKSServer(t, tenants)
 	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	// This test issues two fetches for "configured-tenant" back to back;
+	// disable the unrelated minFetchInterval cooldown (see
+	// TestFetcher_Fetch_ThrottlesRepeatedFetchesRegardlessOfExemption)
+	// so it isn't what's being exercised here.
+	f.minFetchInterval = 0
 
 	// Simulates a background-refresh fetch: no per-call tenant in ctx.
 	if err := f.fetch(context.Background()); err != nil {
@@ -248,6 +254,11 @@ func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
 	tenants := &tenantRecorder{}
 	ts := testJWKSServer(t, tenants)
 	f := NewFetcher(ts.URL, 0, nil, "")
+	// Half these goroutines share the SAME resolved tenant ("") and are
+	// expected to all succeed — this test is about tenant leakage, not
+	// the separate minFetchInterval cooldown (see
+	// TestFetcher_Fetch_ThrottlesRepeatedFetchesRegardlessOfExemption).
+	f.minFetchInterval = 0
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -342,6 +353,10 @@ func testPerTenantJWKSServer(t *testing.T) *httptest.Server {
 func TestFetcher_GetKey_PartitionsCacheByTenant(t *testing.T) {
 	ts := testPerTenantJWKSServer(t)
 	f := NewFetcher(ts.URL, 0, nil, "")
+	// This test repeatedly re-fetches tenant A and tenant B (via the
+	// cross-tenant-miss-triggered refreshes below); it's about
+	// partitioning, not the separate minFetchInterval cooldown.
+	f.minFetchInterval = 0
 
 	ctxA := ContextWithTenantID(context.Background(), "tenant-a")
 	ctxB := ContextWithTenantID(context.Background(), "tenant-b")
@@ -485,6 +500,7 @@ func TestFetcher_Fetch_RateLimitsNewTenantAdmission(t *testing.T) {
 	f := NewFetcher(ts.URL, 0, nil, "")
 	f.admissionLimit = 3
 	f.admissionWindow = time.Hour // long window: no mid-test refill
+	f.minFetchInterval = 0        // this test re-fetches tenant-0; unrelated to the cooldown
 
 	for i := 0; i < 3; i++ {
 		tenant := fmt.Sprintf("tenant-%d", i)
@@ -517,6 +533,7 @@ func TestFetcher_Fetch_ConfiguredTenantExemptFromEvictionAndAdmissionLimit(t *te
 	f.cacheCapacity = 2
 	f.admissionLimit = 2
 	f.admissionWindow = time.Hour
+	f.minFetchInterval = 0 // this test re-fetches the configured tenant twice; unrelated to the cooldown
 
 	// protectedCtx carries no per-call tenant, so it resolves to the
 	// configured tenant (see tenantForContext).
@@ -613,5 +630,130 @@ func TestFetcher_Fetch_SpoofedTenantClaimDoesNotGetEvictionProtection(t *testing
 	// configuredTenantID.
 	if ks := f.KeySet("configured-tenant"); ks != nil {
 		t.Error("expected the spoofed entry (created by an explicit claim, not the fallback path) to be evictable, but it survived as if protected")
+	}
+}
+
+// TestFetcher_Fetch_ThrottlesRepeatedFetchesRegardlessOfExemption is a
+// regression test for two related Copilot-review findings: bounding
+// tenant *admission* (maxCachedTenants, admitNewTenant) does not bound
+// refetch *rate* for a tenant that's already admitted. Neither the
+// viaFallback exemption nor the "already cached" exemption in
+// admitNewTenant say anything about how often GetKey's kid-miss path may
+// re-trigger a fetch for the SAME tenant — and the kid is itself
+// unverified and attacker-controlled, independent of tenant identity or
+// admission status. It proves that once a tenant slot exists (the
+// protected/fallback one, or an ordinary already-cached one), a rapid
+// repeat fetch attempt for that same tenant is throttled.
+func TestFetcher_Fetch_ThrottlesRepeatedFetchesRegardlessOfExemption(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.minFetchInterval = time.Hour // long window: no mid-test refill
+
+	// First fetch for the protected/fallback tenant succeeds and creates
+	// its LRU entry.
+	if err := f.fetch(context.Background()); err != nil {
+		t.Fatalf("initial fallback fetch failed: %v", err)
+	}
+	// A second attempt for the SAME tenant shortly after — simulating a
+	// kid-miss-driven refetch — must be throttled, not silently exempted
+	// just because this tenant is the protected/fallback one.
+	if err := f.fetch(context.Background()); err == nil {
+		t.Error("expected a rapid repeat fetch for the protected/fallback tenant to be throttled by minFetchInterval")
+	}
+
+	// The same protection applies to an ordinary, already-cached explicit
+	// tenant — the "cached" exemption in admitNewTenant is not a license
+	// to refetch it as fast as requests arrive.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "established-tenant")); err != nil {
+		t.Fatalf("initial fetch for established-tenant failed: %v", err)
+	}
+	if err := f.fetch(ContextWithTenantID(context.Background(), "established-tenant")); err == nil {
+		t.Error("expected a rapid repeat fetch for an already-cached tenant to be throttled by minFetchInterval")
+	}
+}
+
+// TestFetcher_GetKey_ThrottlesRepeatedRefreshOnKidMiss is the GetKey-level
+// counterpart of the fetch-throttling test above, exercising the actual
+// attack path a Copilot review described: an attacker sending requests
+// with no (or an invalidated) tenant claim resolves via the very same
+// fallback path a genuine background refresh uses, and GetKey calls fetch
+// on every single kid-miss. Without a cooldown, repeatedly sending
+// distinct, nonexistent kid values would force a fresh outbound JWKS
+// fetch on every single request. It proves that after the first
+// kid-miss-triggered fetch, a second kid-miss for the same tenant shortly
+// after never reaches the network at all.
+func TestFetcher_GetKey_ThrottlesRepeatedRefreshOnKidMiss(t *testing.T) {
+	var reqCount int32
+	ks := testKeySet(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.minFetchInterval = time.Hour
+
+	ctx := context.Background() // no per-call tenant: the common, untenanted case
+
+	if _, err := f.GetKey(ctx, "nonexistent-kid-1"); err == nil {
+		t.Fatal("expected an error for a kid that doesn't exist in the JWKS")
+	}
+	if _, err := f.GetKey(ctx, "nonexistent-kid-2"); err == nil {
+		t.Fatal("expected the second, rapid kid-miss lookup to also fail (throttled)")
+	}
+
+	if got := atomic.LoadInt32(&reqCount); got != 1 {
+		t.Errorf("expected exactly 1 outbound JWKS request across both kid-miss lookups (the second should have been throttled before reaching the network), got %d", got)
+	}
+}
+
+// TestFetcher_Fetch_UpgradesExistingSlotToProtectedOnGenuineFallback is a
+// regression test for a Copilot-review finding: touchTenantLocked's
+// existing-entry branch used to only move the LRU node to the front,
+// discarding viaFallback — so a slot an attacker's spoofed claim created
+// first (protected=false) stayed unprotected forever, even once a genuine
+// fallback fetch later claimed the very same tenant string. Unrelated
+// tenant churn could then evict the operator-configured slot despite the
+// documented exemption. It proves the slot IS upgraded to protected once
+// a genuine fallback fetch reuses it, and survives eviction pressure
+// afterward.
+func TestFetcher_Fetch_UpgradesExistingSlotToProtectedOnGenuineFallback(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.cacheCapacity = 2
+	f.admissionLimit = 10
+	f.admissionWindow = time.Hour
+	f.minFetchInterval = 0 // this test deliberately re-fetches the same tenant string
+
+	// An attacker's explicit claim reaches the fetcher first — creates an
+	// UNPROTECTED entry for "configured-tenant".
+	spoofedCtx := ContextWithTenantID(context.Background(), "configured-tenant")
+	if err := f.fetch(spoofedCtx); err != nil {
+		t.Fatalf("spoofed fetch failed: %v", err)
+	}
+
+	// A genuine fallback fetch (e.g. the background-refresh ticker) later
+	// claims the SAME tenant string — this must upgrade the existing
+	// entry to protected.
+	if err := f.fetch(context.Background()); err != nil {
+		t.Fatalf("genuine fallback fetch failed: %v", err)
+	}
+
+	// Fill the rest of the small cache with an unrelated tenant, then add
+	// one more to force eviction pressure.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "other-tenant")); err != nil {
+		t.Fatalf("other-tenant fetch failed: %v", err)
+	}
+	if err := f.fetch(ContextWithTenantID(context.Background(), "third-tenant")); err != nil {
+		t.Fatalf("third-tenant fetch failed: %v", err)
+	}
+
+	// The now-protected "configured-tenant" slot must have survived —
+	// "other-tenant" (the only remaining non-protected entry) should have
+	// been evicted instead.
+	if ks := f.KeySet("configured-tenant"); ks == nil {
+		t.Error("expected the configured tenant's slot to survive after being upgraded to protected by a genuine fallback fetch, but it was evicted")
 	}
 }
