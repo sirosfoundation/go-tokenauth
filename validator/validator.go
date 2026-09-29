@@ -31,6 +31,15 @@ type Config struct {
 	// JWKSRefresh is the background refresh interval for JWKS keys. Default: 5m.
 	JWKSRefresh time.Duration
 
+	// TenantID is a static, operator-configured tenant identifier for this
+	// Validator's deployment. It is NOT derived from any JWT claim (unlike
+	// the per-request routing tenant extracted from an incoming token — see
+	// jwks.ContextWithTenantID) and is used only as the X-Tenant-ID fallback
+	// for the JWKS fetcher's background refresh, which has no per-call
+	// tenant of its own. Optional; leave empty if the JWKS endpoint isn't
+	// tenant-aware or this deployment is single-tenant.
+	TenantID string
+
 	// Issuer is the expected "iss" claim value.
 	Issuer string
 
@@ -73,7 +82,7 @@ func New(cfg Config) *Validator {
 
 	var fetcher *jwks.Fetcher
 	if cfg.JWKSURL != "" {
-		fetcher = jwks.NewFetcher(cfg.JWKSURL, cfg.JWKSRefresh, nil)
+		fetcher = jwks.NewFetcher(cfg.JWKSURL, cfg.JWKSRefresh, nil, cfg.TenantID)
 	}
 
 	return &Validator{
@@ -134,6 +143,17 @@ func (v *Validator) validateAsymmetric(ctx context.Context, rawToken string) (*c
 		return nil, fmt.Errorf("tokenauth: JWKS not configured")
 	}
 
+	// Checked before any JWKS fetch: an empty configured audience list is a
+	// configuration error (see below for why), and checking it up front
+	// means a misconfigured validator refuses immediately rather than
+	// still performing a network fetch — and creating a tenant-cache
+	// entry — keyed by the unverified, attacker-supplied routing claim
+	// extracted further down, for every distinct tenant an attacker cares
+	// to send, before eventually failing anyway.
+	if len(v.cfg.Audiences) == 0 {
+		return nil, fmt.Errorf("tokenauth: no audiences configured; refusing to validate without an audience restriction")
+	}
+
 	tok, err := jwt.ParseSigned(rawToken, []gojose.SignatureAlgorithm{
 		gojose.ES256, gojose.ES384, gojose.EdDSA,
 	})
@@ -166,13 +186,15 @@ func (v *Validator) validateAsymmetric(ctx context.Context, rawToken string) (*c
 		return nil, fmt.Errorf("tokenauth: signature verification failed: %w", err)
 	}
 
-	// Validate standard claims.
+	// Validate standard claims. (The empty-Audiences config-error check
+	// happens up front, before the JWKS fetch — see the top of this
+	// function. go-jose's jwt.Expected would otherwise treat an empty
+	// AnyAudience as "don't check audience at all", which would fail
+	// open.)
 	expected := jwt.Expected{
-		Issuer: v.cfg.Issuer,
-		Time:   time.Now(),
-	}
-	if len(v.cfg.Audiences) > 0 {
-		expected.AnyAudience = v.cfg.Audiences
+		Issuer:      v.cfg.Issuer,
+		AnyAudience: v.cfg.Audiences,
+		Time:        time.Now(),
 	}
 	if err := ac.ValidateWithLeeway(expected, v.cfg.Leeway); err != nil {
 		return nil, fmt.Errorf("tokenauth: claim validation failed: %w", err)
@@ -206,16 +228,39 @@ type LegacyTokenClaims struct {
 
 // validateLegacy validates a legacy HMAC-signed token.
 func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
+	// Audience validation is mandatory: an empty configured audience list is
+	// a configuration error, not permission to skip the check (omitting
+	// gojwt.WithAudience entirely disables audience enforcement, which
+	// would fail open).
+	if len(v.cfg.Audiences) == 0 {
+		return nil, fmt.Errorf("tokenauth: no audiences configured; refusing to validate without an audience restriction")
+	}
+
+	// Legacy.Issuers is the source of truth for which issuers legacy tokens
+	// may carry. Callers that only set the shared Config.Issuer (used by the
+	// asymmetric path) without duplicating it into Legacy.Issuers still get
+	// an issuer check here rather than silently having none.
+	issuers := v.cfg.Legacy.Issuers
+	if len(issuers) == 0 && v.cfg.Issuer != "" {
+		issuers = []string{v.cfg.Issuer}
+	}
+	if len(issuers) == 0 {
+		return nil, fmt.Errorf("tokenauth: no legacy issuers configured; refusing to validate without an issuer restriction")
+	}
+
 	opts := []gojwt.ParserOption{
 		gojwt.WithLeeway(v.cfg.Leeway),
-	}
-	// Add issuer validation if configured.
-	if len(v.cfg.Legacy.Issuers) > 0 {
-		// golang-jwt only supports single issuer — check first, validate rest manually.
-		opts = append(opts, gojwt.WithIssuer(v.cfg.Legacy.Issuers[0]))
-	}
-	for _, aud := range v.cfg.Audiences {
-		opts = append(opts, gojwt.WithAudience(aud))
+		// A single call with all configured audiences: golang-jwt v5's
+		// WithAudience REPLACES the parser's expected-audience set on every
+		// call rather than accumulating, so calling it once per audience in
+		// a loop silently dropped every audience but the last.
+		gojwt.WithAudience(v.cfg.Audiences...),
+		// Deliberately NOT using gojwt.WithIssuer here: it only supports a
+		// single exact issuer and enforces it inside ParseWithClaims itself,
+		// which would hard-reject a token using any accepted issuer other
+		// than issuers[0] before the manual multi-issuer check below ever
+		// runs. Issuer membership is checked manually after parsing instead,
+		// uniformly for one or many configured issuers.
 	}
 
 	token, err := gojwt.ParseWithClaims(rawToken, &LegacyTokenClaims{}, func(t *gojwt.Token) (interface{}, error) {
@@ -233,18 +278,15 @@ func (v *Validator) validateLegacy(rawToken string) (*claims.Result, error) {
 		return nil, fmt.Errorf("tokenauth: invalid legacy token claims")
 	}
 
-	// Check additional issuers if more than one configured.
-	if len(v.cfg.Legacy.Issuers) > 1 {
-		issuerOK := false
-		for _, iss := range v.cfg.Legacy.Issuers {
-			if lc.Issuer == iss {
-				issuerOK = true
-				break
-			}
+	issuerOK := false
+	for _, iss := range issuers {
+		if lc.Issuer == iss {
+			issuerOK = true
+			break
 		}
-		if !issuerOK {
-			return nil, fmt.Errorf("tokenauth: legacy token issuer %q not accepted", lc.Issuer)
-		}
+	}
+	if !issuerOK {
+		return nil, fmt.Errorf("tokenauth: legacy token issuer %q not accepted", lc.Issuer)
 	}
 
 	return &claims.Result{
