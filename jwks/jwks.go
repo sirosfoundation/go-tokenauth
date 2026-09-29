@@ -15,20 +15,27 @@ import (
 	"github.com/go-jose/go-jose/v4"
 )
 
-// Fetcher maintains a cached copy of JWKS keys from a remote endpoint.
+// Fetcher maintains cached copies of JWKS keys from a remote endpoint,
+// partitioned per tenant.
 //
 // Fetcher instances are shared across concurrent callers (e.g. one Fetcher
 // per Validator, serving every request that Validator handles). Nothing
-// derived from a single caller's unverified claims may be stored on the
-// struct itself, since that would leak between unrelated callers sharing
-// the instance — see ContextWithTenantID, which is threaded through per
-// call via context.Context instead.
+// derived from a single caller's unverified claims may be stored as a
+// scalar field on the struct itself, since that would leak between
+// unrelated callers sharing the instance — see ContextWithTenantID, which
+// is threaded through per call via context.Context instead. The key cache
+// (keySets) is deliberately a map keyed by tenant rather than a single
+// shared value: a cache hit for one tenant must never be served to a
+// lookup for a different tenant, so every fetch and lookup resolves and
+// uses the same effective tenant key (see tenantForContext) throughout.
+// The untenanted case (no per-call tenant and no configuredTenantID) uses
+// the empty string as its own, separate slot.
 type Fetcher struct {
 	url       string
 	refresh   time.Duration
 	client    *http.Client
 	mu        sync.RWMutex
-	keySet    *jose.JSONWebKeySet
+	keySets   map[string]*jose.JSONWebKeySet
 	lastFetch time.Time
 	cancel    context.CancelFunc
 
@@ -37,7 +44,7 @@ type Fetcher struct {
 	// Unlike a per-request tenant (see ContextWithTenantID), it is NOT
 	// derived from any unverified JWT claim, never mutates after
 	// construction, and so cannot leak between callers sharing this
-	// Fetcher. It exists solely as the X-Tenant-ID fallback for
+	// Fetcher. It exists solely as the tenant fallback for
 	// background-refresh fetches (Start's ticker), which run on the
 	// context passed to Start and so never carry a per-call tenant of
 	// their own; a real, per-call fetch always prefers ctx's tenant over
@@ -70,8 +77,21 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 		url:                url,
 		refresh:            refreshInterval,
 		client:             client,
+		keySets:            make(map[string]*jose.JSONWebKeySet),
 		configuredTenantID: configuredTenantID,
 	}
+}
+
+// tenantForContext resolves the effective tenant key to use for both the
+// outbound X-Tenant-ID header and the per-tenant cache slot: a per-call
+// tenant from ctx if present, otherwise the static, operator-configured
+// fallback, otherwise "" (the untenanted default slot). fetch and GetKey
+// both call this so they always agree on which tenant a given call is for.
+func (f *Fetcher) tenantForContext(ctx context.Context) string {
+	if tenantID, ok := ctx.Value(tenantIDContextKey{}).(string); ok && tenantID != "" {
+		return tenantID
+	}
+	return f.configuredTenantID
 }
 
 // Start begins background key refresh. Call Stop() to clean up.
@@ -102,18 +122,25 @@ func (f *Fetcher) Stop() {
 	}
 }
 
-// KeySet returns the full cached JWKS. May be nil if no fetch has succeeded.
-func (f *Fetcher) KeySet() *jose.JSONWebKeySet {
+// KeySet returns the cached JWKS for the given tenant ("" for the
+// untenanted/default slot — see tenantForContext). May be nil if no fetch
+// has succeeded for that tenant yet.
+func (f *Fetcher) KeySet(tenant string) *jose.JSONWebKeySet {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.keySet
+	return f.keySets[tenant]
 }
 
-// GetKey looks up a key by kid. If the kid is not found in cache,
-// triggers an on-demand refresh and retries once (handles key rotation race).
+// GetKey looks up a key by kid, scoped to ctx's effective tenant (see
+// tenantForContext). If the kid is not found in that tenant's cache,
+// triggers an on-demand refresh for that same tenant and retries once
+// (handles key rotation race). A cache hit for one tenant is never
+// returned for a lookup resolving to a different tenant.
 func (f *Fetcher) GetKey(ctx context.Context, kid string) ([]jose.JSONWebKey, error) {
+	tenant := f.tenantForContext(ctx)
+
 	f.mu.RLock()
-	ks := f.keySet
+	ks := f.keySets[tenant]
 	f.mu.RUnlock()
 
 	if ks != nil {
@@ -123,43 +150,41 @@ func (f *Fetcher) GetKey(ctx context.Context, kid string) ([]jose.JSONWebKey, er
 		}
 	}
 
-	// kid not found — try a refresh in case of key rotation.
+	// kid not found in this tenant's cache — try a refresh in case of key
+	// rotation. fetch resolves the same tenant from ctx, so this refreshes
+	// (and re-checks) the same cache slot, never a different tenant's.
 	if err := f.fetch(ctx); err != nil {
 		return nil, fmt.Errorf("jwks: failed to refresh keys: %w", err)
 	}
 
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.keySet == nil {
+	ks = f.keySets[tenant]
+	if ks == nil {
 		return nil, fmt.Errorf("jwks: no keys available")
 	}
-	keys := f.keySet.Key(kid)
+	keys := ks.Key(kid)
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("jwks: key %q not found", kid)
 	}
 	return keys, nil
 }
 
-// fetch retrieves the JWKS from the remote endpoint.
+// fetch retrieves the JWKS from the remote endpoint and stores it in the
+// cache slot for ctx's effective tenant (see tenantForContext) — never in
+// a single shared slot that a different tenant's lookup could also read.
 func (f *Fetcher) fetch(ctx context.Context) error {
+	tenant := f.tenantForContext(ctx)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
 		return fmt.Errorf("jwks: failed to create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	// A per-call tenant ID (see issuerRequestTenantID in the validator
-	// package) comes from an unverified JWT claim and is derived fresh per
-	// call from ctx — it must never be persisted on the shared Fetcher, or
-	// one caller's unverified claim would leak into another caller's
-	// request that shares this Fetcher instance. When no per-call tenant is
-	// present (background refresh via Start's ticker, which has no request
-	// of its own), fall back to the static, operator-configured
-	// configuredTenantID instead of sending no header or reusing a stale
-	// unverified value.
-	if tenantID, ok := ctx.Value(tenantIDContextKey{}).(string); ok && tenantID != "" {
-		req.Header.Set("X-Tenant-ID", tenantID)
-	} else if f.configuredTenantID != "" {
-		req.Header.Set("X-Tenant-ID", f.configuredTenantID)
+	// tenant is "" for the untenanted case (no per-call tenant and no
+	// configuredTenantID) — send no header then, exactly as before.
+	if tenant != "" {
+		req.Header.Set("X-Tenant-ID", tenant)
 	}
 
 	resp, err := f.client.Do(req)
@@ -183,7 +208,7 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
-	f.keySet = &ks
+	f.keySets[tenant] = &ks
 	f.lastFetch = time.Now()
 	f.mu.Unlock()
 

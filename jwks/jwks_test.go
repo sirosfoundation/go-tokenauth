@@ -109,13 +109,13 @@ func TestFetcher_KeySet(t *testing.T) {
 	ctx := context.Background()
 
 	// Before fetch, KeySet should be nil.
-	if f.KeySet() != nil {
+	if f.KeySet("") != nil {
 		t.Error("expected nil KeySet before fetch")
 	}
 
 	_, _ = f.GetKey(ctx, "test-kid")
 
-	ks := f.KeySet()
+	ks := f.KeySet("")
 	if ks == nil {
 		t.Fatal("expected non-nil KeySet after fetch")
 	}
@@ -135,7 +135,7 @@ func TestFetcher_Start(t *testing.T) {
 	defer f.Stop()
 
 	// After Start, keys should be available.
-	ks := f.KeySet()
+	ks := f.KeySet("")
 	if ks == nil {
 		t.Fatal("expected keys after Start")
 	}
@@ -293,6 +293,132 @@ func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
 	for want, count := range expected {
 		if got[want] != count {
 			t.Errorf("tenant header %q: expected %d occurrences, got %d (headers=%v) — state leaked across concurrent calls", want, count, got[want], headers)
+		}
+	}
+}
+
+// testPerTenantJWKSServer starts a JWKS server whose response depends on
+// the X-Tenant-ID header of each request: it returns a single key whose kid
+// is "kid-<tenant>" (or "kid-none" if the header is absent), all signing
+// with the same underlying key pair. This lets tests distinguish which
+// tenant's response actually ended up in a given cache slot.
+func testPerTenantJWKSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tenant := r.Header.Get("X-Tenant-ID")
+		kid := "kid-none"
+		if tenant != "" {
+			kid = "kid-" + tenant
+		}
+		jwk := jose.JSONWebKey{
+			Key:       key.Public(),
+			KeyID:     kid,
+			Algorithm: string(jose.ES256),
+			Use:       "sig",
+		}
+		ks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// TestFetcher_GetKey_PartitionsCacheByTenant is a regression test for a
+// Copilot-review finding: the cache used to be a single, tenant-unpartitioned
+// *jose.JSONWebKeySet field, so a background refresh (or any fetch) for one
+// tenant could populate the one shared cache with that tenant's keys, and a
+// later GetKey call for an unrelated tenant would return them on a kid
+// match — cross-tenant key exposure. It proves tenant A's and tenant B's
+// cached keys coexist (neither evicts the other) and a GetKey call scoped
+// to one tenant never resolves a kid that was only ever fetched for the
+// other tenant.
+func TestFetcher_GetKey_PartitionsCacheByTenant(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+
+	ctxA := ContextWithTenantID(context.Background(), "tenant-a")
+	ctxB := ContextWithTenantID(context.Background(), "tenant-b")
+
+	if _, err := f.GetKey(ctxA, "kid-tenant-a"); err != nil {
+		t.Fatalf("GetKey for tenant A's own kid failed: %v", err)
+	}
+	if _, err := f.GetKey(ctxB, "kid-tenant-b"); err != nil {
+		t.Fatalf("GetKey for tenant B's own kid failed: %v", err)
+	}
+
+	// Tenant A's context must never resolve tenant B's kid, and vice versa
+	// — a cache hit under one tenant's slot must not satisfy a lookup
+	// scoped to a different tenant.
+	if _, err := f.GetKey(ctxA, "kid-tenant-b"); err == nil {
+		t.Error("expected tenant A's context to NOT resolve tenant B's kid — cache is not tenant-partitioned")
+	}
+	if _, err := f.GetKey(ctxB, "kid-tenant-a"); err == nil {
+		t.Error("expected tenant B's context to NOT resolve tenant A's kid — cache is not tenant-partitioned")
+	}
+
+	// Tenant A's own kid must still resolve afterward — proving the failed
+	// cross-tenant lookups (and the refresh-on-miss they triggered) didn't
+	// evict tenant A's legitimate cache entry.
+	if _, err := f.GetKey(ctxA, "kid-tenant-a"); err != nil {
+		t.Errorf("expected tenant A's own kid to still resolve after cross-tenant lookups, got: %v", err)
+	}
+	if _, err := f.GetKey(ctxB, "kid-tenant-b"); err != nil {
+		t.Errorf("expected tenant B's own kid to still resolve after cross-tenant lookups, got: %v", err)
+	}
+
+	if ks := f.KeySet("tenant-a"); ks == nil || len(ks.Keys) != 1 || ks.Keys[0].KeyID != "kid-tenant-a" {
+		t.Errorf("expected tenant-a's KeySet to hold exactly kid-tenant-a, got %+v", ks)
+	}
+	if ks := f.KeySet("tenant-b"); ks == nil || len(ks.Keys) != 1 || ks.Keys[0].KeyID != "kid-tenant-b" {
+		t.Errorf("expected tenant-b's KeySet to hold exactly kid-tenant-b, got %+v", ks)
+	}
+}
+
+// TestFetcher_Fetch_ConcurrentTenantsCoexistWithoutClobbering runs
+// concurrent fetches for many distinct tenants on one shared Fetcher and
+// proves every tenant's cache slot ends up holding exactly that tenant's
+// own key — no concurrent write to the per-tenant cache map clobbers
+// another tenant's entry. Run with -race to also catch any unsynchronized
+// access to the map.
+func TestFetcher_Fetch_ConcurrentTenantsCoexistWithoutClobbering(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tenant := fmt.Sprintf("tenant-%d", i)
+			ctx := ContextWithTenantID(context.Background(), tenant)
+			if err := f.fetch(ctx); err != nil {
+				errs <- fmt.Errorf("tenant %s: fetch failed: %w", tenant, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	for i := 0; i < n; i++ {
+		tenant := fmt.Sprintf("tenant-%d", i)
+		ks := f.KeySet(tenant)
+		if ks == nil || len(ks.Keys) != 1 {
+			t.Fatalf("tenant %s: expected exactly 1 cached key, got %+v", tenant, ks)
+		}
+		wantKid := "kid-" + tenant
+		if ks.Keys[0].KeyID != wantKid {
+			t.Errorf("tenant %s: expected cached kid %q, got %q — cache entries clobbered each other", tenant, wantKid, ks.Keys[0].KeyID)
 		}
 	}
 }
