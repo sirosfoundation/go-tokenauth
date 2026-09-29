@@ -4,6 +4,7 @@
 package jwks
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,16 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 )
+
+// maxCachedTenants bounds the per-tenant key cache. The cache key comes
+// from an unverified, attacker-influenced claim (see tenantForContext and
+// issuerRequestTenantID in the validator package) — without a bound, an
+// attacker sending many syntactically-valid-looking but distinct tenant
+// values could grow the cache without limit and force a fetch to the real
+// JWKS endpoint for each one (memory and request-amplification DoS). When
+// the cache is at capacity, the least-recently-fetched tenant's entry is
+// evicted to make room for a new one.
+const maxCachedTenants = 256
 
 // Fetcher maintains cached copies of JWKS keys from a remote endpoint,
 // partitioned per tenant.
@@ -31,11 +42,16 @@ import (
 // The untenanted case (no per-call tenant and no configuredTenantID) uses
 // the empty string as its own, separate slot.
 type Fetcher struct {
-	url       string
-	refresh   time.Duration
-	client    *http.Client
-	mu        sync.RWMutex
-	keySets   map[string]*jose.JSONWebKeySet
+	url     string
+	refresh time.Duration
+	client  *http.Client
+	mu      sync.RWMutex
+	keySets map[string]*jose.JSONWebKeySet
+	// lru and lruElems bound keySets to maxCachedTenants entries (see its
+	// doc comment): lru's front is the most-recently-fetched tenant, back
+	// is the least-recently-fetched and the next to be evicted.
+	lru       *list.List
+	lruElems  map[string]*list.Element
 	lastFetch time.Time
 	cancel    context.CancelFunc
 
@@ -78,8 +94,31 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 		refresh:            refreshInterval,
 		client:             client,
 		keySets:            make(map[string]*jose.JSONWebKeySet),
+		lru:                list.New(),
+		lruElems:           make(map[string]*list.Element),
 		configuredTenantID: configuredTenantID,
 	}
+}
+
+// touchTenantLocked records tenant as the most-recently-fetched entry,
+// evicting the least-recently-fetched tenant's cache slot first if tenant
+// is new and the cache is already at maxCachedTenants. Caller must hold
+// f.mu (write lock).
+func (f *Fetcher) touchTenantLocked(tenant string) {
+	if el, ok := f.lruElems[tenant]; ok {
+		f.lru.MoveToFront(el)
+		return
+	}
+	if f.lru.Len() >= maxCachedTenants {
+		oldest := f.lru.Back()
+		if oldest != nil {
+			oldTenant, _ := oldest.Value.(string) // always a string: only touchTenantLocked pushes onto lru
+			f.lru.Remove(oldest)
+			delete(f.lruElems, oldTenant)
+			delete(f.keySets, oldTenant)
+		}
+	}
+	f.lruElems[tenant] = f.lru.PushFront(tenant)
 }
 
 // tenantForContext resolves the effective tenant key to use for both the
@@ -208,6 +247,7 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
+	f.touchTenantLocked(tenant)
 	f.keySets[tenant] = &ks
 	f.lastFetch = time.Now()
 	f.mu.Unlock()

@@ -422,3 +422,45 @@ func TestFetcher_Fetch_ConcurrentTenantsCoexistWithoutClobbering(t *testing.T) {
 		}
 	}
 }
+
+// TestFetcher_Fetch_BoundsTenantCacheSize is a regression test for a
+// Copilot-review finding: the tenant is an unverified, attacker-influenced
+// claim (see issuerRequestTenantID in the validator package), so without a
+// bound an attacker sending many distinct syntactically-valid tenant values
+// could grow the per-tenant cache without limit and force a fetch to the
+// real JWKS endpoint for each one — memory and request-amplification DoS.
+// It proves the cache never holds more than maxCachedTenants entries and
+// evicts the least-recently-fetched tenant first.
+func TestFetcher_Fetch_BoundsTenantCacheSize(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+
+	// Fetch one more tenant than the cache can hold, in order, then confirm
+	// the very first (least-recently-fetched) tenant was evicted while the
+	// most recent maxCachedTenants remain.
+	for i := 0; i < maxCachedTenants+1; i++ {
+		tenant := fmt.Sprintf("tenant-%d", i)
+		if err := f.fetch(ContextWithTenantID(context.Background(), tenant)); err != nil {
+			t.Fatalf("tenant %s: fetch failed: %v", tenant, err)
+		}
+	}
+
+	f.mu.RLock()
+	cacheSize := len(f.keySets)
+	lruSize := f.lru.Len()
+	f.mu.RUnlock()
+	if cacheSize > maxCachedTenants {
+		t.Fatalf("expected cache to hold at most %d entries, got %d", maxCachedTenants, cacheSize)
+	}
+	if lruSize != cacheSize {
+		t.Fatalf("expected LRU tracking size (%d) to match cache size (%d)", lruSize, cacheSize)
+	}
+
+	if ks := f.KeySet("tenant-0"); ks != nil {
+		t.Errorf("expected the least-recently-fetched tenant (tenant-0) to have been evicted, but it is still cached: %+v", ks)
+	}
+	lastTenant := fmt.Sprintf("tenant-%d", maxCachedTenants)
+	if ks := f.KeySet(lastTenant); ks == nil {
+		t.Errorf("expected the most-recently-fetched tenant (%s) to still be cached", lastTenant)
+	}
+}
