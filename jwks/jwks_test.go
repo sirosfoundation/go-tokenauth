@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1175,5 +1176,142 @@ func TestFetcher_GetKey_ConcurrentCacheMissesCoalesceInsteadOfFailing(t *testing
 
 	if got := atomic.LoadInt32(&reqCount); got == 0 {
 		t.Error("expected at least 1 outbound JWKS request")
+	}
+}
+
+// TestFetcher_Fetch_FollowerHonorsContextCancellation is a regression test
+// for a Copilot-review finding: a follower joining an in-flight fetch (see
+// fetch's coalescing) used to wait unconditionally on the leader's
+// channel, never observing its own context's cancellation. If the leader
+// were stuck on a stalled JWKS endpoint, a canceled follower would block
+// until the unrelated leader finished, letting goroutines accumulate and
+// defeating request deadlines. It proves a follower whose context is
+// already canceled returns promptly with the context error instead of
+// waiting for a slow leader.
+func TestFetcher_Fetch_FollowerHonorsContextCancellation(t *testing.T) {
+	ks := testKeySet(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond) // wide enough for the follower to reliably join, then cancel
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	f := NewFetcher(ts.URL, 0, nil, "")
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		leaderDone <- f.fetch(context.Background())
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		_, inFlight := f.inFlightFetches[""]
+		f.mu.Unlock()
+		if inFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the leader fetch to register as in-flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	followerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- f.fetch(followerCtx) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected the follower to return context.Canceled, got: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("follower did not honor its own context cancellation and blocked on the stalled leader")
+	}
+
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader fetch failed: %v", err)
+	}
+}
+
+// TestFetcher_Fetch_CoalescedFallbackStillUpgradesProtection is a
+// regression test for a Copilot-review finding: a genuine fallback call
+// (e.g. Start's ticker) that joins an in-flight fetch as a follower (see
+// fetch's coalescing) used to skip touchTenantLocked entirely — including
+// its protected-upgrade logic — since a follower doesn't perform admission
+// or the network round-trip itself. A slot an attacker's spoofed claim
+// created and is currently (slowly) fetching could therefore stay
+// unprotected even though the fallback path genuinely ran concurrently
+// with it. It proves a fallback call joining as a follower still upgrades
+// the slot to protected, which then survives subsequent eviction
+// pressure.
+func TestFetcher_Fetch_CoalescedFallbackStillUpgradesProtection(t *testing.T) {
+	ks := testKeySet(t)
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.cacheCapacity = 2
+	f.admissionLimit = 10
+	f.admissionWindow = time.Hour
+	f.minFetchInterval = 0
+
+	// An attacker's explicit claim becomes the leader for
+	// "configured-tenant" — a slow request, still in flight.
+	leaderDone := make(chan error, 1)
+	go func() {
+		leaderDone <- f.fetch(ContextWithTenantID(context.Background(), "configured-tenant"))
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		_, inFlight := f.inFlightFetches["configured-tenant"]
+		f.mu.Unlock()
+		if inFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the leader fetch to register as in-flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A genuine fallback call joins as a follower while the spoofed
+	// claim's fetch is still in flight.
+	followerDone := make(chan error, 1)
+	go func() {
+		followerDone <- f.fetch(internalRefreshContext(context.Background()))
+	}()
+	time.Sleep(50 * time.Millisecond) // let the follower observe in-flight and apply the upgrade
+
+	close(release)
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader fetch failed: %v", err)
+	}
+	if err := <-followerDone; err != nil {
+		t.Fatalf("coalesced fallback fetch failed: %v", err)
+	}
+
+	// Fill the rest of the small cache with unrelated tenants to force
+	// eviction pressure.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "other-tenant")); err != nil {
+		t.Fatalf("other-tenant fetch failed: %v", err)
+	}
+	if err := f.fetch(ContextWithTenantID(context.Background(), "third-tenant")); err != nil {
+		t.Fatalf("third-tenant fetch failed: %v", err)
+	}
+
+	if ks := f.KeySet("configured-tenant"); ks == nil {
+		t.Error("expected the configured tenant's slot to survive eviction pressure after being upgraded to protected by a COALESCED fallback call, but it was evicted")
 	}
 }

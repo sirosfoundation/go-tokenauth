@@ -518,9 +518,33 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 
 	f.mu.Lock()
 	if ch, inFlight := f.inFlightFetches[tenant]; inFlight {
+		// Preserve fallback provenance even when joining a fetch that a
+		// non-fallback caller already started: a genuine fallback call
+		// (e.g. Start's ticker) must still be able to mark this slot
+		// protected, even though it isn't the one doing admission or the
+		// network round-trip this time. The leader's own call to
+		// touchTenantLocked (which created this entry, if it exists at
+		// all) has already returned by the time any follower can observe
+		// inFlight == true — both happen under this same lock — so it's
+		// safe to look the entry up here directly.
+		if viaFallback {
+			if el, ok := f.lruElems[tenant]; ok {
+				entry, _ := el.Value.(tenantLRUEntry)
+				entry.protected = true
+				el.Value = entry
+			}
+		}
 		f.mu.Unlock()
-		<-ch
-		return nil // the in-flight fetch has completed; caller re-checks the cache itself
+		select {
+		case <-ch:
+			return nil // the in-flight fetch has completed; caller re-checks the cache itself
+		case <-ctx.Done():
+			// Honor the follower's own context: without this, a canceled
+			// request handler would block until an unrelated, possibly
+			// slow or stalled leader fetch finishes, letting goroutines
+			// accumulate and defeating request deadlines.
+			return ctx.Err()
+		}
 	}
 	ch := make(chan struct{})
 	f.inFlightFetches[tenant] = ch

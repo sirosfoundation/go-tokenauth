@@ -143,6 +143,17 @@ func (v *Validator) validateAsymmetric(ctx context.Context, rawToken string) (*c
 		return nil, fmt.Errorf("tokenauth: JWKS not configured")
 	}
 
+	// Checked before any JWKS fetch: an empty configured audience list is a
+	// configuration error (see below for why), and checking it up front
+	// means a misconfigured validator refuses immediately rather than
+	// still performing a network fetch — and creating a tenant-cache
+	// entry — keyed by the unverified, attacker-supplied routing claim
+	// extracted further down, for every distinct tenant an attacker cares
+	// to send, before eventually failing anyway.
+	if len(v.cfg.Audiences) == 0 {
+		return nil, fmt.Errorf("tokenauth: no audiences configured; refusing to validate without an audience restriction")
+	}
+
 	tok, err := jwt.ParseSigned(rawToken, []gojose.SignatureAlgorithm{
 		gojose.ES256, gojose.ES384, gojose.EdDSA,
 	})
@@ -175,15 +186,11 @@ func (v *Validator) validateAsymmetric(ctx context.Context, rawToken string) (*c
 		return nil, fmt.Errorf("tokenauth: signature verification failed: %w", err)
 	}
 
-	// Audience validation is mandatory: an empty configured audience list is
-	// a configuration error, not permission to skip the check. go-jose's
-	// jwt.Expected treats an empty AnyAudience as "don't check audience at
-	// all", which would fail open, so we refuse to validate instead.
-	if len(v.cfg.Audiences) == 0 {
-		return nil, fmt.Errorf("tokenauth: no audiences configured; refusing to validate without an audience restriction")
-	}
-
-	// Validate standard claims.
+	// Validate standard claims. (The empty-Audiences config-error check
+	// happens up front, before the JWKS fetch — see the top of this
+	// function. go-jose's jwt.Expected would otherwise treat an empty
+	// AnyAudience as "don't check audience at all", which would fail
+	// open.)
 	expected := jwt.Expected{
 		Issuer:      v.cfg.Issuer,
 		AnyAudience: v.cfg.Audiences,

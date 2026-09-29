@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -407,6 +408,53 @@ func TestValidator_Asymmetric_EmptyAudiencesIsConfigError(t *testing.T) {
 
 	if _, err := v.Validate(ctx, token); err == nil {
 		t.Error("expected error when no audiences are configured, got nil (fail-open)")
+	}
+}
+
+// TestValidator_Asymmetric_EmptyAudiencesRefusesBeforeTouchingJWKS is a
+// regression test for a Copilot-review finding: the empty-Audiences
+// config-error check used to run AFTER the JWKS fetch (GetKey), so a
+// misconfigured validator still performed an outbound JWKS request — and
+// could populate a tenant-cache entry keyed by the unverified,
+// attacker-supplied routing claim, for every distinct tenant an attacker
+// cares to send — before ultimately refusing. It proves no JWKS request
+// happens at all when Audiences is empty, even for a token carrying a
+// routing tenant claim. Deliberately does not call Start, so the only
+// possible JWKS request would come from Validate's own GetKey call.
+func TestValidator_Asymmetric_EmptyAudiencesRefusesBeforeTouchingJWKS(t *testing.T) {
+	var requests int32
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwk := gojose.JSONWebKey{
+		Key:       key.Public(),
+		KeyID:     "test-kid",
+		Algorithm: string(gojose.ES256),
+		Use:       "sig",
+	}
+	ks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	v := New(Config{
+		JWKSURL: ts.URL,
+		Issuer:  "test-issuer",
+		// Audiences deliberately left empty.
+	})
+
+	token := issueTestTokenWithRoutingTenant(t, key, "test-kid", "test-issuer", "anything-goes", "tenant-1", "attacker-tenant", claims.TAC("rl"))
+
+	if _, err := v.Validate(context.Background(), token); err == nil {
+		t.Error("expected error when no audiences are configured, got nil (fail-open)")
+	}
+
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Errorf("expected no JWKS request to be made before the audience-config error is returned, got %d", got)
 	}
 }
 
