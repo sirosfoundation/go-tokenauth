@@ -864,3 +864,105 @@ func TestFetcher_CommitFetchResult_DiscardsStaleGenerations(t *testing.T) {
 		t.Errorf("expected the newer (generation 2) keys to survive a stale (generation 1) late response, got %+v", ks)
 	}
 }
+
+// TestFetcher_CommitFetchResult_GenerationsUniqueAcrossEvictionAndReadmission
+// is a regression test for a Copilot-review finding on the generation
+// mechanism itself: an earlier version reset a tenant's generation
+// counter to 1 whenever its slot was newly created — including when it
+// was RE-created after being evicted. A stale, still-in-flight fetch from
+// BEFORE the eviction could then coincidentally carry the exact same
+// generation number as a fresh (re-)admission afterward, letting
+// commitFetchResultLocked mistake the stale response for current and
+// overwrite fresher keys. It proves a generation captured BEFORE a
+// tenant's eviction is never reused by a later re-admission of the same
+// tenant, and that the stale response is correctly discarded.
+func TestFetcher_CommitFetchResult_GenerationsUniqueAcrossEvictionAndReadmission(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.cacheCapacity = 1
+	f.minFetchInterval = 0
+
+	// Admit "victim-tenant" and capture its generation — simulating a
+	// slow fetch that's still in flight (generation captured, response
+	// not yet committed).
+	f.mu.Lock()
+	_, staleGen := f.touchTenantLocked("victim-tenant", false)
+	f.mu.Unlock()
+
+	// Evict "victim-tenant" by admitting a different tenant into a cache
+	// with capacity 1.
+	f.mu.Lock()
+	_, _ = f.touchTenantLocked("other-tenant", false)
+	f.mu.Unlock()
+	if ks := f.KeySet("victim-tenant"); ks != nil {
+		t.Fatal("expected victim-tenant to have been evicted to make room")
+	}
+
+	// Re-admit "victim-tenant" — e.g. a fresh, legitimate request for it
+	// arrives — and let its own fetch commit first.
+	f.mu.Lock()
+	_, freshGen := f.touchTenantLocked("victim-tenant", false)
+	f.mu.Unlock()
+	if freshGen == staleGen {
+		t.Fatalf("expected the re-admitted tenant's generation (%d) to differ from the stale, pre-eviction one (%d)", freshGen, staleGen)
+	}
+
+	freshKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{KeyID: "fresh-key"}}}
+	f.mu.Lock()
+	f.commitFetchResultLocked("victim-tenant", freshGen, freshKS)
+	f.mu.Unlock()
+
+	// The stale, pre-eviction fetch (captured staleGen) finally "returns"
+	// and must not be mistaken for current.
+	staleKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{KeyID: "stale-key"}}}
+	f.mu.Lock()
+	f.commitFetchResultLocked("victim-tenant", staleGen, staleKS)
+	f.mu.Unlock()
+
+	ks := f.KeySet("victim-tenant")
+	if ks == nil || len(ks.Keys) != 1 || ks.Keys[0].KeyID != "fresh-key" {
+		t.Errorf("expected the fresh (re-admitted) generation's keys to survive a stale pre-eviction generation's late response, got %+v", ks)
+	}
+}
+
+// TestFetcher_Fetch_AdmissionChargedAtomicallyUnderConcurrentChurn is a
+// regression test for a "previously missed" Copilot-review finding: an
+// earlier version of admission control read "is this tenant cached" via
+// a separate lock acquisition that was released before touchTenantLocked
+// ran — a concurrent eviction between those two steps could let a
+// re-admission through without ever consuming the admission budget.
+// touchTenantLocked now decides cache presence, admission charging, and
+// eviction/creation all under one continuously-held lock, so the total
+// number of admissions can never exceed admissionLimit, no matter how
+// much concurrent churn (many distinct tenants racing for a
+// deliberately tiny cache capacity, forcing constant eviction) is thrown
+// at it. Run with -race; this asserts an exact invariant (not a
+// probabilistic reproduction of the old race), so it holds deterministically
+// on the fixed code regardless of scheduling.
+func TestFetcher_Fetch_AdmissionChargedAtomicallyUnderConcurrentChurn(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.cacheCapacity = 1 // forces eviction on every new tenant admitted
+	f.admissionLimit = 5
+	f.admissionWindow = time.Hour
+	f.minFetchInterval = 0
+
+	const n = 50
+	var wg sync.WaitGroup
+	var admitted int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tenant := fmt.Sprintf("tenant-%d", i)
+			if err := f.fetch(ContextWithTenantID(context.Background(), tenant)); err == nil {
+				atomic.AddInt32(&admitted, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&admitted); got != int32(f.admissionLimit) {
+		t.Errorf("expected exactly %d admissions under concurrent churn (cacheCapacity=1 forces eviction on every new tenant), got %d — admission budget was bypassed", f.admissionLimit, got)
+	}
+}
