@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
 )
@@ -434,6 +435,12 @@ func TestFetcher_Fetch_ConcurrentTenantsCoexistWithoutClobbering(t *testing.T) {
 func TestFetcher_Fetch_BoundsTenantCacheSize(t *testing.T) {
 	ts := testPerTenantJWKSServer(t)
 	f := NewFetcher(ts.URL, 0, nil, "")
+	// This test is specifically about the LRU size bound, not the separate
+	// new-tenant admission rate limiter (see TestFetcher_Fetch_*Admission*
+	// below) — relax the limiter so a fast sequential burst of
+	// maxCachedTenants+1 distinct tenants isn't itself throttled.
+	f.admissionLimit = maxCachedTenants * 2
+	f.admissionWindow = time.Hour
 
 	// Fetch one more tenant than the cache can hold, in order, then confirm
 	// the very first (least-recently-fetched) tenant was evicted while the
@@ -462,5 +469,81 @@ func TestFetcher_Fetch_BoundsTenantCacheSize(t *testing.T) {
 	lastTenant := fmt.Sprintf("tenant-%d", maxCachedTenants)
 	if ks := f.KeySet(lastTenant); ks == nil {
 		t.Errorf("expected the most-recently-fetched tenant (%s) to still be cached", lastTenant)
+	}
+}
+
+// TestFetcher_Fetch_RateLimitsNewTenantAdmission is a regression test for a
+// second-order Copilot-review finding on the cache-size bound above:
+// bounding memory alone does not bound outbound requests, since cycling
+// through more tenants than the cache holds still triggers one fetch per
+// distinct value and repeatedly evicts entries. It proves a previously
+// uncached tenant beyond the configured admission limit is refused
+// (without ever calling the JWKS endpoint for it), while re-fetching an
+// already-cached tenant is never subject to that limit.
+func TestFetcher_Fetch_RateLimitsNewTenantAdmission(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.admissionLimit = 3
+	f.admissionWindow = time.Hour // long window: no mid-test refill
+
+	for i := 0; i < 3; i++ {
+		tenant := fmt.Sprintf("tenant-%d", i)
+		if err := f.fetch(ContextWithTenantID(context.Background(), tenant)); err != nil {
+			t.Fatalf("tenant %s: expected fetch within the admission limit to succeed, got: %v", tenant, err)
+		}
+	}
+
+	// A 4th distinct, previously-uncached tenant exceeds the limit.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "tenant-over-limit")); err == nil {
+		t.Error("expected a fetch for a new tenant beyond the admission limit to be refused")
+	}
+
+	// Re-fetching an already-cached tenant (one of the first 3) is not
+	// subject to the new-tenant limit — it isn't "new".
+	if err := f.fetch(ContextWithTenantID(context.Background(), "tenant-0")); err != nil {
+		t.Errorf("expected re-fetching an already-cached tenant to succeed regardless of the new-tenant limit, got: %v", err)
+	}
+}
+
+// TestFetcher_Fetch_ConfiguredTenantExemptFromEvictionAndAdmissionLimit
+// proves the operator-configured tenant is immune to both protections
+// added for the unverified, attacker-influenced tenant claim: it is never
+// evicted by the bounded LRU cache to make room for other tenants, and it
+// is never subject to the new-tenant admission rate limiter, regardless of
+// how much unrelated tenant churn a caller (or attacker) generates.
+func TestFetcher_Fetch_ConfiguredTenantExemptFromEvictionAndAdmissionLimit(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.cacheCapacity = 2
+	f.admissionLimit = 2
+	f.admissionWindow = time.Hour
+
+	// protectedCtx carries no per-call tenant, so it resolves to the
+	// configured tenant (see tenantForContext).
+	protectedCtx := context.Background()
+	if err := f.fetch(protectedCtx); err != nil {
+		t.Fatalf("initial fetch for the configured tenant failed: %v", err)
+	}
+
+	// Exhaust both the tiny cache capacity and the admission limit with
+	// unrelated tenants. Some of these are expected to be refused by the
+	// admission limiter once it's exhausted — that's the point being
+	// exercised, not a test failure.
+	for i := 0; i < 5; i++ {
+		tenant := fmt.Sprintf("attacker-tenant-%d", i)
+		_ = f.fetch(ContextWithTenantID(context.Background(), tenant))
+	}
+
+	// The configured tenant's cache entry must still be there — the LRU
+	// bound (cacheCapacity=2) would otherwise have evicted it long before
+	// 5 unrelated tenants were admitted.
+	if ks := f.KeySet("configured-tenant"); ks == nil {
+		t.Fatal("expected the configured tenant's cache entry to survive unrelated tenant churn, but it was evicted")
+	}
+
+	// The configured tenant must also remain fetchable even after the
+	// admission limiter above is exhausted by unrelated tenants.
+	if err := f.fetch(protectedCtx); err != nil {
+		t.Errorf("expected the configured tenant to remain exempt from the new-tenant admission limit, got: %v", err)
 	}
 }

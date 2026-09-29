@@ -20,11 +20,29 @@ import (
 // from an unverified, attacker-influenced claim (see tenantForContext and
 // issuerRequestTenantID in the validator package) — without a bound, an
 // attacker sending many syntactically-valid-looking but distinct tenant
-// values could grow the cache without limit and force a fetch to the real
-// JWKS endpoint for each one (memory and request-amplification DoS). When
-// the cache is at capacity, the least-recently-fetched tenant's entry is
-// evicted to make room for a new one.
+// values could grow the cache without limit (memory DoS). When the cache
+// is at capacity, the least-recently-fetched tenant's entry is evicted to
+// make room for a new one — except the operator-configured tenant (see
+// protectedTenant), which is never evicted.
+//
+// maxCachedTenants alone does not bound the resulting *request*
+// amplification: an attacker cycling through more than maxCachedTenants
+// distinct tenants can still force one outbound JWKS fetch per distinct
+// value, indefinitely, and repeatedly evict every non-protected entry.
+// maxNewTenantFetchesPerWindow/newTenantFetchWindow (see admitNewTenant)
+// bound that separately, by rate-limiting fetches for tenants not already
+// cached.
 const maxCachedTenants = 256
+
+// maxNewTenantFetchesPerWindow and newTenantFetchWindow bound how many
+// previously-uncached tenants may trigger an outbound JWKS fetch within a
+// given window (see admitNewTenant). Already-cached tenants and the
+// operator-configured tenant (see protectedTenant) are exempt and never
+// count against this limit.
+const (
+	maxNewTenantFetchesPerWindow = 64
+	newTenantFetchWindow         = time.Second
+)
 
 // Fetcher maintains cached copies of JWKS keys from a remote endpoint,
 // partitioned per tenant.
@@ -50,10 +68,13 @@ type Fetcher struct {
 	// lru and lruElems bound keySets to maxCachedTenants entries (see its
 	// doc comment): lru's front is the most-recently-fetched tenant, back
 	// is the least-recently-fetched and the next to be evicted.
-	lru       *list.List
-	lruElems  map[string]*list.Element
-	lastFetch time.Time
-	cancel    context.CancelFunc
+	lru      *list.List
+	lruElems map[string]*list.Element
+	// cacheCapacity defaults to maxCachedTenants; only overridden by tests
+	// to exercise eviction without a large number of fetches.
+	cacheCapacity int
+	lastFetch     time.Time
+	cancel        context.CancelFunc
 
 	// configuredTenantID is a static, operator-configured tenant identifier
 	// supplied once at construction time (from validator.Config.TenantID).
@@ -64,8 +85,20 @@ type Fetcher struct {
 	// background-refresh fetches (Start's ticker), which run on the
 	// context passed to Start and so never carry a per-call tenant of
 	// their own; a real, per-call fetch always prefers ctx's tenant over
-	// this value.
+	// this value. It also identifies the one tenant slot that is exempt
+	// from LRU eviction and new-tenant rate limiting — see
+	// protectedTenant.
 	configuredTenantID string
+
+	// admissionMu, admissionCount and admissionResetAt implement the
+	// new-tenant fetch rate limiter described at
+	// maxNewTenantFetchesPerWindow. admissionLimit/admissionWindow default
+	// to those constants; only overridden by tests for determinism.
+	admissionMu      sync.Mutex
+	admissionCount   int
+	admissionResetAt time.Time
+	admissionLimit   int
+	admissionWindow  time.Duration
 }
 
 type tenantIDContextKey struct{}
@@ -96,29 +129,82 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 		keySets:            make(map[string]*jose.JSONWebKeySet),
 		lru:                list.New(),
 		lruElems:           make(map[string]*list.Element),
+		cacheCapacity:      maxCachedTenants,
 		configuredTenantID: configuredTenantID,
+		admissionLimit:     maxNewTenantFetchesPerWindow,
+		admissionWindow:    newTenantFetchWindow,
 	}
 }
 
+// protectedTenant returns the one tenant slot that is exempt from LRU
+// eviction and from the new-tenant fetch rate limiter: the
+// operator-configured tenant if one was set at construction, otherwise the
+// untenanted default slot (""). Both represent legitimate, static
+// configuration rather than attacker-controlled input, so churn from other
+// (attacker-influenced) tenants must never starve or evict it.
+func (f *Fetcher) protectedTenant() string {
+	return f.configuredTenantID
+}
+
 // touchTenantLocked records tenant as the most-recently-fetched entry,
-// evicting the least-recently-fetched tenant's cache slot first if tenant
-// is new and the cache is already at maxCachedTenants. Caller must hold
-// f.mu (write lock).
+// evicting the least-recently-fetched non-protected tenant's cache slot
+// first if tenant is new and the cache is already at cacheCapacity. Caller
+// must hold f.mu (write lock).
 func (f *Fetcher) touchTenantLocked(tenant string) {
 	if el, ok := f.lruElems[tenant]; ok {
 		f.lru.MoveToFront(el)
 		return
 	}
-	if f.lru.Len() >= maxCachedTenants {
-		oldest := f.lru.Back()
-		if oldest != nil {
+	if f.lru.Len() >= f.cacheCapacity {
+		protected := f.protectedTenant()
+		for oldest := f.lru.Back(); oldest != nil; oldest = oldest.Prev() {
 			oldTenant, _ := oldest.Value.(string) // always a string: only touchTenantLocked pushes onto lru
+			if oldTenant == protected {
+				continue // never evict the operator-configured/default slot
+			}
 			f.lru.Remove(oldest)
 			delete(f.lruElems, oldTenant)
 			delete(f.keySets, oldTenant)
+			break
 		}
+		// If every existing entry is the protected tenant (only possible
+		// with cacheCapacity == 1), nothing is evicted and the cache
+		// simply grows by one rather than evicting protected state.
 	}
 	f.lruElems[tenant] = f.lru.PushFront(tenant)
+}
+
+// admitNewTenant reports whether ctx's tenant may trigger an outbound JWKS
+// fetch right now. The protected tenant (see protectedTenant) and any
+// tenant already present in the cache always are; any other tenant is
+// subject to admissionLimit/admissionWindow, so an attacker cycling
+// through many distinct unverified tenant claims cannot generate unbounded
+// outbound requests to the JWKS endpoint or repeatedly evict legitimate
+// cache entries by forcing constant churn.
+func (f *Fetcher) admitNewTenant(tenant string) bool {
+	if tenant == f.protectedTenant() {
+		return true
+	}
+
+	f.mu.RLock()
+	_, cached := f.keySets[tenant]
+	f.mu.RUnlock()
+	if cached {
+		return true
+	}
+
+	f.admissionMu.Lock()
+	defer f.admissionMu.Unlock()
+	now := time.Now()
+	if now.After(f.admissionResetAt) {
+		f.admissionCount = 0
+		f.admissionResetAt = now.Add(f.admissionWindow)
+	}
+	if f.admissionCount >= f.admissionLimit {
+		return false
+	}
+	f.admissionCount++
+	return true
 }
 
 // tenantForContext resolves the effective tenant key to use for both the
@@ -214,6 +300,10 @@ func (f *Fetcher) GetKey(ctx context.Context, kid string) ([]jose.JSONWebKey, er
 // a single shared slot that a different tenant's lookup could also read.
 func (f *Fetcher) fetch(ctx context.Context) error {
 	tenant := f.tenantForContext(ctx)
+
+	if !f.admitNewTenant(tenant) {
+		return fmt.Errorf("jwks: too many distinct tenants requested keys recently; refusing to fetch for %q", tenant)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
