@@ -521,6 +521,7 @@ func TestFetcher_Fetch_BoundsTenantCacheSize(t *testing.T) {
 func TestFetcher_Fetch_RateLimitsNewTenantAdmission(t *testing.T) {
 	ts := testPerTenantJWKSServer(t)
 	f := NewFetcher(ts.URL, 0, nil, "")
+	f.admissionShards = make([]admissionShard, 1) // single shard: exercise the total limit deterministically, not sharded fairness
 	f.admissionLimit = 3
 	f.admissionWindow = time.Hour // long window: no mid-test refill
 	f.minFetchInterval = 0        // this test re-fetches tenant-0; unrelated to the cooldown
@@ -938,6 +939,7 @@ func TestFetcher_CommitFetchResult_GenerationsUniqueAcrossEvictionAndReadmission
 	f := NewFetcher(ts.URL, 0, nil, "")
 	f.cacheCapacity = 1
 	f.minFetchInterval = 0
+	f.admissionLimit = 100 // this test is about generation uniqueness, not admission limits
 
 	// Admit "victim-tenant" and capture its attempt — simulating a slow
 	// fetch that's still in flight (attempt captured, response not yet
@@ -999,28 +1001,39 @@ func TestFetcher_CommitFetchResult_GenerationsUniqueAcrossEvictionAndReadmission
 func TestFetcher_Fetch_AdmissionChargedAtomicallyUnderConcurrentChurn(t *testing.T) {
 	ts := testPerTenantJWKSServer(t)
 	f := NewFetcher(ts.URL, 0, nil, "")
-	f.cacheCapacity = 1 // forces eviction on every new tenant admitted
+	f.cacheCapacity = 1                           // forces eviction on every new tenant admitted
+	f.admissionShards = make([]admissionShard, 1) // single shard: this test exercises the total admission budget, not sharded fairness
 	f.admissionLimit = 5
 	f.admissionWindow = time.Hour
 	f.minFetchInterval = 0
 
+	// Under this deliberately extreme churn (cacheCapacity=1, 50 racing
+	// distinct tenants), many individual fetch() calls legitimately fail
+	// even after being charged once: their slot gets evicted before
+	// commit, their bounded retry re-admits, and that retry can itself be
+	// refused once the shared budget is exhausted — the budget correctly
+	// applying to retries too, not a bug. So "count successful calls" is
+	// no longer a valid proxy for "count admission charges"; the actual
+	// invariant this test cares about — the shard's charge count never
+	// exceeds its limit, no matter how much concurrent churn hits it — is
+	// checked directly instead.
 	const n = 50
 	var wg sync.WaitGroup
-	var admitted int32
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			tenant := fmt.Sprintf("tenant-%d", i)
-			if err := f.fetch(ContextWithTenantID(context.Background(), tenant)); err == nil {
-				atomic.AddInt32(&admitted, 1)
-			}
+			_ = f.fetch(ContextWithTenantID(context.Background(), tenant))
 		}(i)
 	}
 	wg.Wait()
 
-	if got := atomic.LoadInt32(&admitted); got != int32(f.admissionLimit) {
-		t.Errorf("expected exactly %d admissions under concurrent churn (cacheCapacity=1 forces eviction on every new tenant), got %d — admission budget was bypassed", f.admissionLimit, got)
+	f.mu.RLock()
+	shardCount := f.admissionShards[0].count
+	f.mu.RUnlock()
+	if shardCount > f.admissionLimit {
+		t.Errorf("expected the admission shard's charge count to never exceed its limit (%d) despite concurrent churn, got %d — admission budget was bypassed", f.admissionLimit, shardCount)
 	}
 }
 
@@ -1066,16 +1079,13 @@ func TestFetcher_Fetch_RejectsAdmissionWhenNothingEvictable(t *testing.T) {
 	}
 
 	// The refused attempt's admission-budget charge must have been rolled
-	// back, not permanently consumed: admissionLimit (5) more attempts for
-	// distinct, evictable-context tenants should still all be refused for
-	// the SAME underlying reason (nothing evictable), not because the
-	// budget was silently exhausted by the earlier rollback failing.
-	// Simplest direct check: the admission counter itself is back to 0.
+	// back, not permanently consumed. Simplest direct check: the specific
+	// shard "other-tenant" hashes into is back to a count of 0.
 	f.mu.RLock()
-	admissionCount := f.admissionCount
+	shardCount := f.admissionShards[f.admissionShardIndex("other-tenant")].count
 	f.mu.RUnlock()
-	if admissionCount != 0 {
-		t.Errorf("expected the refused admission's budget charge to be rolled back to 0, got %d", admissionCount)
+	if shardCount != 0 {
+		t.Errorf("expected the refused admission's budget charge to be rolled back to 0, got %d", shardCount)
 	}
 }
 
@@ -1313,5 +1323,130 @@ func TestFetcher_Fetch_CoalescedFallbackStillUpgradesProtection(t *testing.T) {
 
 	if ks := f.KeySet("configured-tenant"); ks == nil {
 		t.Error("expected the configured tenant's slot to survive eviction pressure after being upgraded to protected by a COALESCED fallback call, but it was evicted")
+	}
+}
+
+// TestFetcher_Fetch_AdmissionShardingIsolatesFloodedTenants is a
+// regression test for a Copilot-review finding: a single, global
+// admission counter shared by every non-fallback tenant let a flood of
+// distinct unverified tenant claims exhaust the entire new-tenant
+// admission budget, starving a legitimate, never-before-seen tenant that
+// had not itself exceeded any limit. It proves that exhausting one
+// admission shard (see admissionShardIndex) does not affect a distinct
+// tenant hashing into a different shard, while a second distinct tenant
+// hashing into the SAME (exhausted) shard is still correctly refused.
+func TestFetcher_Fetch_AdmissionShardingIsolatesFloodedTenants(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.admissionShards = make([]admissionShard, 2)
+	f.admissionLimit = 1
+	f.admissionWindow = time.Hour
+	f.minFetchInterval = 0
+
+	// Find two tenant strings that hash to different shards, and a third
+	// that hashes to the SAME shard as the first.
+	var shard0Tenant, shard0Tenant2, shard1Tenant string
+	for i := 0; shard0Tenant == "" || shard0Tenant2 == "" || shard1Tenant == ""; i++ {
+		if i > 10000 {
+			t.Fatal("could not find tenant strings covering both shards")
+		}
+		tenant := fmt.Sprintf("tenant-%d", i)
+		switch f.admissionShardIndex(tenant) {
+		case 0:
+			if shard0Tenant == "" {
+				shard0Tenant = tenant
+			} else if shard0Tenant2 == "" {
+				shard0Tenant2 = tenant
+			}
+		case 1:
+			if shard1Tenant == "" {
+				shard1Tenant = tenant
+			}
+		}
+	}
+
+	// Exhaust shard 0's budget (limit 1) with the first tenant.
+	if err := f.fetch(ContextWithTenantID(context.Background(), shard0Tenant)); err != nil {
+		t.Fatalf("first admission into shard 0 failed: %v", err)
+	}
+
+	// A second, distinct tenant hashing into the SAME (now exhausted)
+	// shard must be refused.
+	if err := f.fetch(ContextWithTenantID(context.Background(), shard0Tenant2)); err == nil {
+		t.Error("expected a second distinct tenant hashing to the same, exhausted shard to be refused")
+	}
+
+	// A tenant hashing into the OTHER shard must be entirely unaffected
+	// by shard 0's exhaustion — this is the fairness property sharding
+	// provides over a single shared counter.
+	if err := f.fetch(ContextWithTenantID(context.Background(), shard1Tenant)); err != nil {
+		t.Errorf("expected a tenant hashing to a different shard to remain unaffected by shard 0's exhaustion, got: %v", err)
+	}
+}
+
+// TestFetcher_Fetch_RetriesWhenOwnSlotEvictedWhileInFlight is a regression
+// test for a previously-missed Copilot-review finding: fetch's HTTP
+// round-trip runs without holding f.mu, so a tenant's own slot can be
+// evicted by an UNRELATED admission while its fetch is still in flight.
+// commitFetchResultLocked correctly discards the resulting response as
+// stale (see commitDiscardedEvicted), but without a retry the caller
+// would see a spurious "no keys available" failure despite the fetch
+// having actually succeeded over the network. It proves the fetch
+// transparently retries — re-admitting the tenant fresh — and succeeds.
+func TestFetcher_Fetch_RetriesWhenOwnSlotEvictedWhileInFlight(t *testing.T) {
+	ks := testKeySet(t)
+	release := make(chan struct{})
+	var reqCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&reqCount, 1) == 1 {
+			<-release // hold only the FIRST request (victim-tenant's original attempt) open
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.cacheCapacity = 1 // any other admission evicts victim-tenant's sole slot
+	f.admissionLimit = 10
+	f.admissionWindow = time.Hour
+	f.minFetchInterval = 0
+
+	victimDone := make(chan error, 1)
+	go func() {
+		victimDone <- f.fetch(ContextWithTenantID(context.Background(), "victim-tenant"))
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		_, inFlight := f.inFlightFetches["victim-tenant"]
+		f.mu.Unlock()
+		if inFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for victim-tenant's fetch to register as in-flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Admit an unrelated tenant — with cacheCapacity=1, this evicts
+	// victim-tenant's slot while its own fetch is still in flight.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "evictor-tenant")); err != nil {
+		t.Fatalf("evictor-tenant fetch failed: %v", err)
+	}
+	if ks := f.KeySet("victim-tenant"); ks != nil {
+		t.Fatal("expected victim-tenant to have been evicted while its own fetch was in flight")
+	}
+
+	// Release victim-tenant's held response — it must retry and succeed,
+	// not return a spurious error.
+	close(release)
+	if err := <-victimDone; err != nil {
+		t.Errorf("expected victim-tenant's fetch to succeed via retry after its slot was evicted mid-flight, got: %v", err)
+	}
+	if ks := f.KeySet("victim-tenant"); ks == nil {
+		t.Error("expected victim-tenant's keys to be present in the cache after the retry committed")
 	}
 }

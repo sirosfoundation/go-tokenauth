@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"sync"
@@ -38,11 +39,48 @@ const maxCachedTenants = 256
 // previously-uncached tenants may trigger an outbound JWKS fetch within a
 // given window (see touchTenantLocked). Already-cached tenants and the
 // operator-configured tenant (see protectedTenant) are exempt and never
-// count against this limit.
+// count against this limit. This is the EFFECTIVE TOTAL across all
+// admissionShardCount shards (see admissionShard) — NewFetcher divides it
+// by admissionShardCount to get the per-shard limit, so the overall bound
+// is unchanged from a single global counter, but a flood of claims hashing
+// into one shard cannot exhaust the budget for claims hashing into
+// another.
 const (
 	maxNewTenantFetchesPerWindow = 64
 	newTenantFetchWindow         = time.Second
 )
+
+// admissionShardCount is the number of independent admission-rate-limiter
+// shards (see admissionShard and admissionShardIndex). Sharding by tenant
+// hash bounds the "blast radius" of a flood of distinct unverified tenant
+// claims to roughly 1/admissionShardCount of the budget, rather than a
+// single attacker being able to exhaust the entire new-tenant admission
+// budget and starve legitimate, never-before-seen tenants that happen to
+// hash elsewhere. It is a fixed, small constant specifically so this
+// fairness improvement does not itself reintroduce unbounded (per-identity)
+// state — the same bounded-memory principle behind maxCachedTenants.
+const admissionShardCount = 32
+
+// admissionShard is one independent new-tenant admission-rate-limiter
+// bucket — see admissionShardCount.
+type admissionShard struct {
+	count   int
+	resetAt time.Time
+}
+
+// admissionShardIndex deterministically maps tenant to one of
+// f.admissionShards via FNV-1a. It doesn't need to be cryptographically
+// strong — only to spread distinct tenant strings reasonably evenly
+// across shards so one flood doesn't concentrate in a single bucket by
+// construction. Uses len(f.admissionShards) rather than the
+// admissionShardCount constant directly so tests can shrink the slice
+// (e.g. to a single shard) for deterministic, global-style admission
+// behavior when that's what a specific test is exercising.
+func (f *Fetcher) admissionShardIndex(tenant string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(tenant)) // fnv's Write never returns an error
+	return int(h.Sum32() % uint32(len(f.admissionShards)))
+}
 
 // defaultMinFetchInterval bounds how often a fetch may be re-attempted for
 // the SAME tenant slot, independent of admission/eviction exemptions (see
@@ -118,21 +156,35 @@ type Fetcher struct {
 	// protectedTenant.
 	configuredTenantID string
 
-	// admissionCount and admissionResetAt implement the new-tenant fetch
-	// rate limiter described at maxNewTenantFetchesPerWindow.
-	// admissionLimit/admissionWindow default to those constants; only
-	// overridden by tests for determinism. All four are read and written
-	// only from touchTenantLocked, under f.mu (write lock) — folded into
-	// the same critical section as eviction/creation so that "is this
-	// tenant currently cached" and "admit/evict/create" happen atomically
-	// with respect to each other (an earlier, two-step version of this
-	// check read the cache under a separate, released lock, letting a
+	// admissionShards implement the new-tenant fetch rate limiter described
+	// at maxNewTenantFetchesPerWindow, sharded by tenant hash (see
+	// admissionShardIndex) rather than a single shared counter: an
+	// attacker flooding with many distinct unverified tenant claims
+	// consumes budget only in the shard(s) their claims hash into, so a
+	// legitimate new tenant hashing into a different shard is unaffected
+	// — bounding the "blast radius" of one flood to roughly
+	// 1/admissionShardCount of the tenant space instead of the whole
+	// budget. admissionLimit is the PER-SHARD limit (so the effective
+	// total capacity across all shards is admissionLimit *
+	// admissionShardCount); admissionLimit/admissionWindow default to
+	// maxNewTenantFetchesPerWindow/newTenantFetchWindow, divided
+	// appropriately in NewFetcher; only overridden by tests for
+	// determinism. All shards are read and written only from
+	// touchTenantLocked, under f.mu (write lock) — folded into the same
+	// critical section as eviction/creation so that "is this tenant
+	// currently cached" and "admit/evict/create" happen atomically with
+	// respect to each other (an earlier, two-step version of this check
+	// read the cache under a separate, released lock, letting a
 	// concurrent eviction slip a re-admission through without charging
 	// the budget).
-	admissionCount   int
-	admissionResetAt time.Time
-	admissionLimit   int
-	admissionWindow  time.Duration
+	// admissionShards defaults to admissionShardCount entries; only
+	// overridden by tests (e.g. shrunk to a single shard) to get
+	// deterministic, global-style admission behavior when that's what a
+	// specific test is exercising rather than the sharded fairness
+	// property itself.
+	admissionShards []admissionShard
+	admissionLimit  int
+	admissionWindow time.Duration
 
 	// nextGeneration is a Fetcher-wide, monotonically increasing counter.
 	// Each admitted fetch attempt (see touchTenantLocked) gets the next
@@ -190,8 +242,14 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 		cacheCapacity:      maxCachedTenants,
 		minFetchInterval:   defaultMinFetchInterval,
 		configuredTenantID: configuredTenantID,
-		admissionLimit:     maxNewTenantFetchesPerWindow,
-		admissionWindow:    newTenantFetchWindow,
+		admissionShards:    make([]admissionShard, admissionShardCount),
+		// Per-shard limit: dividing the effective total
+		// (maxNewTenantFetchesPerWindow) across admissionShardCount shards
+		// keeps the overall bound the same as a single global counter
+		// while adding fairness — see admissionShard's doc comment. At
+		// least 1 per shard even if the division would round down to 0.
+		admissionLimit:  max(1, maxNewTenantFetchesPerWindow/admissionShardCount),
+		admissionWindow: newTenantFetchWindow,
 	}
 }
 
@@ -310,15 +368,17 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bo
 	// attacker cannot bypass it merely by guessing or copying the
 	// configured tenant's value.
 	chargedAdmission := false
+	var shard *admissionShard
 	if !viaFallback {
-		if now.After(f.admissionResetAt) {
-			f.admissionCount = 0
-			f.admissionResetAt = now.Add(f.admissionWindow)
+		shard = &f.admissionShards[f.admissionShardIndex(tenant)]
+		if now.After(shard.resetAt) {
+			shard.count = 0
+			shard.resetAt = now.Add(f.admissionWindow)
 		}
-		if f.admissionCount >= f.admissionLimit {
+		if shard.count >= f.admissionLimit {
 			return false, fetchAttempt{}
 		}
-		f.admissionCount++
+		shard.count++
 		chargedAdmission = true
 	}
 
@@ -341,7 +401,7 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bo
 			// nothing to evict, so reject this admission rather than
 			// grow the cache past cacheCapacity.
 			if chargedAdmission {
-				f.admissionCount--
+				shard.count--
 			}
 			return false, fetchAttempt{}
 		}
@@ -354,6 +414,27 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bo
 	f.lruElems[tenant] = f.lru.PushFront(entry)
 	return true, fetchAttempt{incarnation: incarnation, seq: seq}
 }
+
+// commitResult reports what commitFetchResultLocked did with a fetch
+// response.
+type commitResult int
+
+const (
+	// commitOK: the response was stored — this attempt is now the most
+	// recently committed one for its incarnation.
+	commitOK commitResult = iota
+	// commitDiscardedEvicted: the tenant's slot no longer exists, or now
+	// belongs to a different incarnation (evicted and re-created since
+	// this attempt was admitted). The response is genuinely lost — fetch
+	// retries once for this reason (see fetch's retry loop) since the
+	// fetch itself succeeded and a fresh admission is likely to succeed
+	// too.
+	commitDiscardedEvicted
+	// commitDiscardedSuperseded: a newer attempt for the SAME incarnation
+	// already committed fresher keys. No retry is needed: the cache
+	// already holds current data for this tenant.
+	commitDiscardedSuperseded
+)
 
 // commitFetchResultLocked stores ks for tenant only if attempt.incarnation
 // still matches the tenant's current slot (i.e. it hasn't been evicted and
@@ -368,22 +449,23 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bo
 // but never successfully committed (e.g. its HTTP request failed) must
 // not be able to block an older, slower attempt's eventual success.
 // Caller must hold f.mu (write lock).
-func (f *Fetcher) commitFetchResultLocked(tenant string, attempt fetchAttempt, ks *jose.JSONWebKeySet) {
+func (f *Fetcher) commitFetchResultLocked(tenant string, attempt fetchAttempt, ks *jose.JSONWebKeySet) commitResult {
 	el, ok := f.lruElems[tenant]
 	if !ok {
-		return // slot was evicted before this response arrived — discard
+		return commitDiscardedEvicted // slot was evicted before this response arrived
 	}
 	entry, _ := el.Value.(tenantLRUEntry)
 	if entry.incarnation != attempt.incarnation {
-		return // this tenant slot has since been evicted and re-created — discard
+		return commitDiscardedEvicted // this tenant slot has since been evicted and re-created
 	}
 	if entry.committed >= attempt.seq {
-		return // a newer attempt already committed for this incarnation — discard
+		return commitDiscardedSuperseded // a newer attempt already committed for this incarnation
 	}
 	entry.committed = attempt.seq
 	el.Value = entry
 	f.keySets[tenant] = ks
 	f.lastFetch = time.Now()
+	return commitOK
 }
 
 // tenantForContext resolves the effective tenant key to use for both the
@@ -548,12 +630,6 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	}
 	ch := make(chan struct{})
 	f.inFlightFetches[tenant] = ch
-	// touchTenantLocked decides both new-tenant admission and the
-	// minFetchInterval refetch cooldown in one atomic step (see its doc
-	// comment for why that matters) — bounding both tenant cardinality
-	// and, independently, how often any single tenant slot may be
-	// refetched at all.
-	allowed, attempt := f.touchTenantLocked(tenant, viaFallback)
 	f.mu.Unlock()
 
 	defer func() {
@@ -563,13 +639,58 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 		close(ch)
 	}()
 
+	// maxFetchAttempts bounds a narrow retry: if this tenant's slot is
+	// evicted by unrelated churn (from OTHER tenants' admissions) while
+	// THIS fetch's HTTP round-trip is in flight — which runs without
+	// holding f.mu — the response is correctly discarded as stale rather
+	// than resurrecting the evicted slot (see commitFetchResultLocked),
+	// but without a retry the caller would see a spurious "no keys
+	// available" failure despite the fetch having actually succeeded.
+	// Retrying re-admits the tenant fresh (its slot no longer exists, so
+	// this is an ordinary new admission, not throttled by
+	// minFetchInterval) and is enough to recover from an isolated
+	// eviction race without risking unbounded work under sustained,
+	// adversarial churn. This loop still holds the SAME in-flight
+	// registration across any retry, so concurrent followers wait for the
+	// final outcome rather than each independently retrying too.
+	const maxFetchAttempts = 2
+	var lastErr error
+	for i := 0; i < maxFetchAttempts; i++ {
+		committed, err := f.doFetchAttempt(ctx, tenant, viaFallback)
+		if err != nil {
+			return err
+		}
+		if committed {
+			return nil
+		}
+		lastErr = fmt.Errorf("jwks: fetch for tenant %q succeeded but its cache slot was evicted before the response could be committed", tenant)
+	}
+	return lastErr
+}
+
+// doFetchAttempt performs one admission/cooldown-checked fetch attempt for
+// tenant and reports whether its response was actually committed to the
+// cache (see commitFetchResultLocked). committed is false with a nil error
+// when the response was discarded because the tenant's slot was evicted
+// while the request was in flight — not because it was superseded by a
+// newer, already-committed attempt, which needs no retry since fresher
+// keys are already in place either way.
+func (f *Fetcher) doFetchAttempt(ctx context.Context, tenant string, viaFallback bool) (committed bool, err error) {
+	// touchTenantLocked decides both new-tenant admission and the
+	// minFetchInterval refetch cooldown in one atomic step (see its doc
+	// comment for why that matters) — bounding both tenant cardinality
+	// and, independently, how often any single tenant slot may be
+	// refetched at all.
+	f.mu.Lock()
+	allowed, attempt := f.touchTenantLocked(tenant, viaFallback)
+	f.mu.Unlock()
 	if !allowed {
-		return fmt.Errorf("jwks: refusing to fetch for tenant %q (rate-limited or attempted too soon)", tenant)
+		return false, fmt.Errorf("jwks: refusing to fetch for tenant %q (rate-limited or attempted too soon)", tenant)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
-		return fmt.Errorf("jwks: failed to create request: %w", err)
+		return false, fmt.Errorf("jwks: failed to create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	// tenant is "" for the untenanted case (no per-call tenant and no
@@ -580,27 +701,27 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("jwks: fetch failed: %w", err)
+		return false, fmt.Errorf("jwks: fetch failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("jwks: endpoint returned %d", resp.StatusCode)
+		return false, fmt.Errorf("jwks: endpoint returned %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
 	if err != nil {
-		return fmt.Errorf("jwks: failed to read response: %w", err)
+		return false, fmt.Errorf("jwks: failed to read response: %w", err)
 	}
 
 	var ks jose.JSONWebKeySet
 	if err := json.Unmarshal(body, &ks); err != nil {
-		return fmt.Errorf("jwks: failed to parse JWKS: %w", err)
+		return false, fmt.Errorf("jwks: failed to parse JWKS: %w", err)
 	}
 
 	f.mu.Lock()
-	f.commitFetchResultLocked(tenant, attempt, &ks)
+	result := f.commitFetchResultLocked(tenant, attempt, &ks)
 	f.mu.Unlock()
 
-	return nil
+	return result != commitDiscardedEvicted, nil
 }
