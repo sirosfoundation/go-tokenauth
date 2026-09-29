@@ -200,21 +200,37 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 // (successful or not), enforcing minFetchInterval between attempts
 // regardless of protected/admission status — see defaultMinFetchInterval.
 //
-// generation increments on every attempt admitted for this tenant slot
-// (see touchTenantLocked). The HTTP round-trip in fetch runs without
-// holding f.mu, so an in-flight response may outlive its slot's eviction,
-// or a newer attempt for the same tenant may be admitted before an older
-// one's response arrives. fetch captures the generation it was admitted
-// under and only commits its response if that generation is still current
-// when the response comes back — see fetch's commit step. This prevents a
-// stale response from resurrecting an evicted entry (with no
-// corresponding lru node, breaking the cacheCapacity bound) or from
-// overwriting a newer attempt's fresher keys.
+// incarnation identifies THIS creation of the slot: it's assigned once,
+// when the slot is created (whether that's truly the first time, or a
+// fresh re-admission after eviction), and never changes for as long as
+// this incarnation of the slot exists. Eviction followed by re-admission
+// always produces a brand-new incarnation (drawn from the Fetcher-wide
+// nextGeneration counter, which never resets), so a response captured
+// under a previous incarnation can never be mistaken for current — see
+// commitFetchResultLocked.
+//
+// committed is the seq (see fetchAttempt) of the most recently
+// SUCCESSFULLY COMMITTED response for this incarnation, not merely the
+// most recently ATTEMPTED one — 0 means nothing has committed yet. This
+// distinction matters: fetch's HTTP round-trip runs without holding f.mu,
+// so a slower attempt can still be in flight when a later attempt for the
+// same tenant is admitted. If the later attempt then fails (network
+// error, non-200, etc.), it never calls commitFetchResultLocked at all,
+// so it must not be able to block the earlier, slower attempt's
+// eventual success from committing — only an attempt whose response has
+// actually landed should be able to supersede an older one.
 type tenantLRUEntry struct {
 	tenant      string
 	protected   bool
 	lastAttempt time.Time
-	generation  uint64
+	incarnation uint64
+	committed   uint64
+}
+
+// fetchAttempt identifies one admitted fetch attempt for commitFetchResultLocked.
+type fetchAttempt struct {
+	incarnation uint64
+	seq         uint64
 }
 
 // touchTenantLocked records an attempt to fetch tenant right now,
@@ -239,31 +255,30 @@ type tenantLRUEntry struct {
 // forcing constant churn. An admitted new tenant's slot is created
 // (lastAttempt = now, protected = viaFallback), evicting the
 // least-recently-attempted non-protected entry first if the cache is
-// already at cacheCapacity.
+// already at cacheCapacity — or, if every existing entry is protected and
+// so nothing is evictable, rejecting this admission outright (rolling
+// back the admission-budget charge above, if any) rather than letting the
+// cache silently grow past cacheCapacity.
 //
 // Caller must hold f.mu (write lock). allowed reports whether the attempt
 // may proceed to the network — fetch must not do so if it's false.
-// generation is this attempt's slot generation, drawn from the
-// Fetcher-wide nextGeneration counter so it is unique across this
-// Fetcher's entire lifetime, even across the same tenant's eviction and
-// later re-admission (see nextGeneration and commitFetchResultLocked).
-func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bool, generation uint64) {
+// attempt must be passed back to commitFetchResultLocked unchanged.
+func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bool, attempt fetchAttempt) {
 	now := time.Now()
 
 	if el, ok := f.lruElems[tenant]; ok {
 		entry, _ := el.Value.(tenantLRUEntry) // always this type: only touchTenantLocked pushes onto lru
 		if now.Sub(entry.lastAttempt) < f.minFetchInterval {
-			return false, 0
+			return false, fetchAttempt{}
 		}
 		f.nextGeneration++
 		entry.lastAttempt = now
-		entry.generation = f.nextGeneration
 		if viaFallback {
 			entry.protected = true
 		}
 		el.Value = entry
 		f.lru.MoveToFront(el)
-		return true, entry.generation
+		return true, fetchAttempt{incarnation: entry.incarnation, seq: f.nextGeneration}
 	}
 
 	// Not currently cached: a genuinely new (or evicted-and-returning)
@@ -271,18 +286,21 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bo
 	// tenantForContext) is what exempts a call from the limiter, so an
 	// attacker cannot bypass it merely by guessing or copying the
 	// configured tenant's value.
+	chargedAdmission := false
 	if !viaFallback {
 		if now.After(f.admissionResetAt) {
 			f.admissionCount = 0
 			f.admissionResetAt = now.Add(f.admissionWindow)
 		}
 		if f.admissionCount >= f.admissionLimit {
-			return false, 0
+			return false, fetchAttempt{}
 		}
 		f.admissionCount++
+		chargedAdmission = true
 	}
 
 	if f.lru.Len() >= f.cacheCapacity {
+		evicted := false
 		for oldest := f.lru.Back(); oldest != nil; oldest = oldest.Prev() {
 			entry, _ := oldest.Value.(tenantLRUEntry)
 			if entry.protected {
@@ -291,36 +309,56 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bo
 			f.lru.Remove(oldest)
 			delete(f.lruElems, entry.tenant)
 			delete(f.keySets, entry.tenant)
+			evicted = true
 			break
 		}
-		// If every existing entry is protected (only possible with
-		// cacheCapacity == 1 and a configured tenant), nothing is evicted
-		// and the cache simply grows by one rather than evicting
-		// protected state.
+		if !evicted {
+			// Every existing entry is protected (only possible with
+			// cacheCapacity == 1 and a configured tenant): there is
+			// nothing to evict, so reject this admission rather than
+			// grow the cache past cacheCapacity.
+			if chargedAdmission {
+				f.admissionCount--
+			}
+			return false, fetchAttempt{}
+		}
 	}
 	f.nextGeneration++
-	entry := tenantLRUEntry{tenant: tenant, protected: viaFallback, lastAttempt: now, generation: f.nextGeneration}
+	incarnation := f.nextGeneration
+	f.nextGeneration++
+	seq := f.nextGeneration
+	entry := tenantLRUEntry{tenant: tenant, protected: viaFallback, lastAttempt: now, incarnation: incarnation}
 	f.lruElems[tenant] = f.lru.PushFront(entry)
-	return true, entry.generation
+	return true, fetchAttempt{incarnation: incarnation, seq: seq}
 }
 
-// commitFetchResultLocked stores ks for tenant only if tenant's cache slot
-// is still at exactly the generation this fetch attempt was admitted
-// under (see touchTenantLocked) — i.e. the slot hasn't since been evicted,
-// and no newer attempt for the same tenant has been admitted ahead of this
-// response arriving. A stale response (slot gone, or superseded by a
-// newer generation) is silently discarded rather than resurrecting an
-// evicted entry or overwriting fresher keys with older ones. Caller must
-// hold f.mu (write lock).
-func (f *Fetcher) commitFetchResultLocked(tenant string, generation uint64, ks *jose.JSONWebKeySet) {
+// commitFetchResultLocked stores ks for tenant only if attempt.incarnation
+// still matches the tenant's current slot (i.e. it hasn't been evicted and
+// re-created since this attempt was admitted — see tenantLRUEntry) AND no
+// attempt with a higher seq has already committed for this same
+// incarnation. A stale response (slot gone, different incarnation, or
+// superseded by an already-committed newer attempt) is silently discarded
+// rather than resurrecting an evicted entry, crossing into a different
+// incarnation of the same tenant string, or overwriting fresher committed
+// keys with older ones. Crucially, this compares against the last
+// COMMITTED seq, not the last ATTEMPTED one: an attempt that was admitted
+// but never successfully committed (e.g. its HTTP request failed) must
+// not be able to block an older, slower attempt's eventual success.
+// Caller must hold f.mu (write lock).
+func (f *Fetcher) commitFetchResultLocked(tenant string, attempt fetchAttempt, ks *jose.JSONWebKeySet) {
 	el, ok := f.lruElems[tenant]
 	if !ok {
 		return // slot was evicted before this response arrived — discard
 	}
 	entry, _ := el.Value.(tenantLRUEntry)
-	if entry.generation != generation {
-		return // superseded by a newer attempt for the same tenant — discard
+	if entry.incarnation != attempt.incarnation {
+		return // this tenant slot has since been evicted and re-created — discard
 	}
+	if entry.committed >= attempt.seq {
+		return // a newer attempt already committed for this incarnation — discard
+	}
+	entry.committed = attempt.seq
+	el.Value = entry
 	f.keySets[tenant] = ks
 	f.lastFetch = time.Now()
 }
@@ -449,7 +487,7 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	// and, independently, how often any single tenant slot may be
 	// refetched at all.
 	f.mu.Lock()
-	allowed, generation := f.touchTenantLocked(tenant, viaFallback)
+	allowed, attempt := f.touchTenantLocked(tenant, viaFallback)
 	f.mu.Unlock()
 	if !allowed {
 		return fmt.Errorf("jwks: refusing to fetch for tenant %q (rate-limited or attempted too soon)", tenant)
@@ -487,7 +525,7 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
-	f.commitFetchResultLocked(tenant, generation, &ks)
+	f.commitFetchResultLocked(tenant, attempt, &ks)
 	f.mu.Unlock()
 
 	return nil

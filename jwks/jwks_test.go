@@ -824,44 +824,82 @@ func TestFetcher_CommitFetchResult_DiscardsStaleGenerations(t *testing.T) {
 	// (a) A response for a tenant with no LRU entry at all must be
 	// discarded, not resurrected into keySets.
 	f.mu.Lock()
-	f.commitFetchResultLocked("never-admitted-tenant", 1, staleKS)
+	f.commitFetchResultLocked("never-admitted-tenant", fetchAttempt{incarnation: 1, seq: 1}, staleKS)
 	f.mu.Unlock()
 	if ks := f.KeySet("never-admitted-tenant"); ks != nil {
 		t.Error("expected a response for a tenant with no LRU entry to be discarded, not resurrected into keySets")
 	}
 
-	// (b) Simulate two attempts for the same tenant: an older one
-	// (generation 1) whose response arrives late, after a newer attempt
-	// (generation 2) has already been admitted and committed its own,
-	// fresher response.
+	// (b) Simulate two attempts for the same tenant: an older one whose
+	// response arrives late, after a newer attempt has already been
+	// admitted and committed its own, fresher response.
 	f.mu.Lock()
-	_, gen1 := f.touchTenantLocked("race-tenant", false)
+	_, olderAttempt := f.touchTenantLocked("race-tenant", false)
 	f.mu.Unlock()
-	if gen1 != 1 {
-		t.Fatalf("expected the first admission to be generation 1, got %d", gen1)
-	}
 
 	f.mu.Lock()
-	_, gen2 := f.touchTenantLocked("race-tenant", false)
+	_, newerAttempt := f.touchTenantLocked("race-tenant", false)
 	f.mu.Unlock()
-	if gen2 != 2 {
-		t.Fatalf("expected the second admission to be generation 2, got %d", gen2)
+	if newerAttempt == olderAttempt {
+		t.Fatalf("expected two distinct attempts for the same tenant to get different fetchAttempt values, both got %+v", olderAttempt)
 	}
 
 	// The newer attempt's response arrives and commits first.
 	f.mu.Lock()
-	f.commitFetchResultLocked("race-tenant", gen2, freshKS)
+	f.commitFetchResultLocked("race-tenant", newerAttempt, freshKS)
 	f.mu.Unlock()
 
 	// The OLDER attempt's response arrives late and must be discarded,
 	// not overwrite the fresher keys.
 	f.mu.Lock()
-	f.commitFetchResultLocked("race-tenant", gen1, staleKS)
+	f.commitFetchResultLocked("race-tenant", olderAttempt, staleKS)
 	f.mu.Unlock()
 
 	ks := f.KeySet("race-tenant")
 	if ks == nil || len(ks.Keys) != 1 || ks.Keys[0].KeyID != "fresh-key" {
-		t.Errorf("expected the newer (generation 2) keys to survive a stale (generation 1) late response, got %+v", ks)
+		t.Errorf("expected the newer attempt's keys to survive a stale, older attempt's late response, got %+v", ks)
+	}
+}
+
+// TestFetcher_CommitFetchResult_OlderAttemptStillCommitsIfNewerNeverDid is
+// a regression test for a Copilot-review finding: an earlier version
+// compared against the last ATTEMPTED (admitted) seq rather than the last
+// COMMITTED one. fetch's HTTP round-trip runs without holding f.mu, so a
+// slower attempt can still be in flight when a later attempt for the same
+// tenant is admitted; if that later attempt then fails (network error,
+// non-200, etc.) it never calls commitFetchResultLocked at all. The
+// earlier, slower attempt's eventual SUCCESS must not be discarded just
+// because a newer attempt was merely admitted and then failed — only an
+// attempt whose response actually landed should be able to supersede an
+// older one. It proves an older attempt still commits successfully when
+// no newer attempt for the same tenant has actually committed.
+func TestFetcher_CommitFetchResult_OlderAttemptStillCommitsIfNewerNeverDid(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.minFetchInterval = 0
+
+	f.mu.Lock()
+	_, olderAttempt := f.touchTenantLocked("slow-tenant", false)
+	f.mu.Unlock()
+
+	// A second attempt is admitted (e.g. another request's kid-miss
+	// arrives before the first, slow fetch returns) but its HTTP request
+	// fails — fetch would never call commitFetchResultLocked for it at
+	// all, so nothing commits for this attempt.
+	f.mu.Lock()
+	_, _ = f.touchTenantLocked("slow-tenant", false)
+	f.mu.Unlock()
+
+	// The first, slower attempt finally succeeds. It must still be able
+	// to commit — nothing newer has actually landed.
+	successKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{KeyID: "success-key"}}}
+	f.mu.Lock()
+	f.commitFetchResultLocked("slow-tenant", olderAttempt, successKS)
+	f.mu.Unlock()
+
+	ks := f.KeySet("slow-tenant")
+	if ks == nil || len(ks.Keys) != 1 || ks.Keys[0].KeyID != "success-key" {
+		t.Errorf("expected the older attempt's successful response to commit since no newer attempt ever did, got %+v", ks)
 	}
 }
 
@@ -882,11 +920,11 @@ func TestFetcher_CommitFetchResult_GenerationsUniqueAcrossEvictionAndReadmission
 	f.cacheCapacity = 1
 	f.minFetchInterval = 0
 
-	// Admit "victim-tenant" and capture its generation — simulating a
-	// slow fetch that's still in flight (generation captured, response
-	// not yet committed).
+	// Admit "victim-tenant" and capture its attempt — simulating a slow
+	// fetch that's still in flight (attempt captured, response not yet
+	// committed).
 	f.mu.Lock()
-	_, staleGen := f.touchTenantLocked("victim-tenant", false)
+	_, staleAttempt := f.touchTenantLocked("victim-tenant", false)
 	f.mu.Unlock()
 
 	// Evict "victim-tenant" by admitting a different tenant into a cache
@@ -901,22 +939,22 @@ func TestFetcher_CommitFetchResult_GenerationsUniqueAcrossEvictionAndReadmission
 	// Re-admit "victim-tenant" — e.g. a fresh, legitimate request for it
 	// arrives — and let its own fetch commit first.
 	f.mu.Lock()
-	_, freshGen := f.touchTenantLocked("victim-tenant", false)
+	_, freshAttempt := f.touchTenantLocked("victim-tenant", false)
 	f.mu.Unlock()
-	if freshGen == staleGen {
-		t.Fatalf("expected the re-admitted tenant's generation (%d) to differ from the stale, pre-eviction one (%d)", freshGen, staleGen)
+	if freshAttempt.incarnation == staleAttempt.incarnation {
+		t.Fatalf("expected the re-admitted tenant's incarnation (%d) to differ from the stale, pre-eviction one (%d)", freshAttempt.incarnation, staleAttempt.incarnation)
 	}
 
 	freshKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{KeyID: "fresh-key"}}}
 	f.mu.Lock()
-	f.commitFetchResultLocked("victim-tenant", freshGen, freshKS)
+	f.commitFetchResultLocked("victim-tenant", freshAttempt, freshKS)
 	f.mu.Unlock()
 
-	// The stale, pre-eviction fetch (captured staleGen) finally "returns"
-	// and must not be mistaken for current.
+	// The stale, pre-eviction fetch (captured staleAttempt) finally
+	// "returns" and must not be mistaken for current.
 	staleKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{KeyID: "stale-key"}}}
 	f.mu.Lock()
-	f.commitFetchResultLocked("victim-tenant", staleGen, staleKS)
+	f.commitFetchResultLocked("victim-tenant", staleAttempt, staleKS)
 	f.mu.Unlock()
 
 	ks := f.KeySet("victim-tenant")
@@ -964,5 +1002,60 @@ func TestFetcher_Fetch_AdmissionChargedAtomicallyUnderConcurrentChurn(t *testing
 
 	if got := atomic.LoadInt32(&admitted); got != int32(f.admissionLimit) {
 		t.Errorf("expected exactly %d admissions under concurrent churn (cacheCapacity=1 forces eviction on every new tenant), got %d — admission budget was bypassed", f.admissionLimit, got)
+	}
+}
+
+// TestFetcher_Fetch_RejectsAdmissionWhenNothingEvictable is a regression
+// test for a Copilot-review finding: with cacheCapacity == 1 and the
+// cache's sole entry being the protected (fallback) tenant, an admission
+// attempt for a different, non-protected tenant used to still create a
+// new slot even though nothing could be evicted to make room — silently
+// growing the cache past cacheCapacity. It proves such an admission is
+// now refused instead, and that the admission-budget charge for the
+// refused attempt is rolled back (not permanently consumed).
+func TestFetcher_Fetch_RejectsAdmissionWhenNothingEvictable(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.cacheCapacity = 1
+	f.admissionLimit = 5
+	f.admissionWindow = time.Hour
+	f.minFetchInterval = 0
+
+	// Populate the sole slot with the protected/fallback tenant.
+	if err := f.fetch(internalRefreshContext(context.Background())); err != nil {
+		t.Fatalf("initial fallback fetch failed: %v", err)
+	}
+
+	// A different tenant now has nothing to evict — the only entry is
+	// protected. This admission must be refused, and the cache must stay
+	// at exactly 1 entry.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "other-tenant")); err == nil {
+		t.Error("expected admission to be refused when no evictable entry exists, but it succeeded")
+	}
+	if ks := f.KeySet("other-tenant"); ks != nil {
+		t.Error("expected the refused tenant to have no cache entry")
+	}
+	if ks := f.KeySet("configured-tenant"); ks == nil {
+		t.Error("expected the protected tenant's entry to remain")
+	}
+
+	f.mu.RLock()
+	cacheSize := len(f.keySets)
+	f.mu.RUnlock()
+	if cacheSize != 1 {
+		t.Errorf("expected the cache to still hold exactly 1 entry (cacheCapacity), got %d", cacheSize)
+	}
+
+	// The refused attempt's admission-budget charge must have been rolled
+	// back, not permanently consumed: admissionLimit (5) more attempts for
+	// distinct, evictable-context tenants should still all be refused for
+	// the SAME underlying reason (nothing evictable), not because the
+	// budget was silently exhausted by the earlier rollback failing.
+	// Simplest direct check: the admission counter itself is back to 0.
+	f.mu.RLock()
+	admissionCount := f.admissionCount
+	f.mu.RUnlock()
+	if admissionCount != 0 {
+		t.Errorf("expected the refused admission's budget charge to be rolled back to 0, got %d", admissionCount)
 	}
 }
