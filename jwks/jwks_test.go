@@ -267,7 +267,7 @@ func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
 	const n = 20
 	var wg sync.WaitGroup
 	errs := make(chan error, n)
-	expected := make(map[string]int, n)
+	expectedTenants := make(map[string]bool, n) // set of tenants SOME goroutine legitimately used
 	var expMu sync.Mutex
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -283,7 +283,7 @@ func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
 				ctx = context.Background()
 			}
 			expMu.Lock()
-			expected[want]++
+			expectedTenants[want] = true
 			expMu.Unlock()
 			if err := f.fetch(ctx); err != nil {
 				errs <- fmt.Errorf("goroutine %d: fetch failed: %w", i, err)
@@ -296,20 +296,38 @@ func TestFetcher_Fetch_ConcurrentCallsDoNotShareTenantState(t *testing.T) {
 		t.Error(err)
 	}
 
+	// The 10 goroutines sharing the SAME resolved tenant ("") may now be
+	// coalesced by fetch's in-flight deduplication (see
+	// Fetcher.inFlightFetches) into fewer than 10 actual network requests
+	// for "" — that's the point of coalescing, not a leak — so an exact
+	// total request count can no longer be asserted. What still proves
+	// "no leakage" is: every observed header is a tenant some goroutine
+	// actually used (never a value nobody requested), and each of the 10
+	// distinct explicit tenants (never shared with another goroutine, so
+	// never coalesced) appears exactly once.
 	headers := tenants.all()
-	if len(headers) != n {
-		t.Fatalf("expected %d requests, got %d", n, len(headers))
+	if len(headers) == 0 {
+		t.Fatal("expected at least 1 request")
 	}
 	got := make(map[string]int, len(headers))
 	for _, h := range headers {
 		got[h]++
 	}
 	expMu.Lock()
-	defer expMu.Unlock()
-	for want, count := range expected {
-		if got[want] != count {
-			t.Errorf("tenant header %q: expected %d occurrences, got %d (headers=%v) — state leaked across concurrent calls", want, count, got[want], headers)
+	for h := range got {
+		if !expectedTenants[h] {
+			t.Errorf("observed header %q that no goroutine actually requested (headers=%v) — state leaked across concurrent calls", h, headers)
 		}
+	}
+	expMu.Unlock()
+	for i := 0; i < n; i += 2 {
+		want := fmt.Sprintf("tenant-%d", i)
+		if got[want] != 1 {
+			t.Errorf("tenant header %q: expected exactly 1 occurrence (never shared with another goroutine, so never coalesced), got %d", want, got[want])
+		}
+	}
+	if got[""] < 1 {
+		t.Error("expected at least 1 request for the untenanted (\"\") case")
 	}
 }
 
@@ -1107,5 +1125,55 @@ func TestFetcher_Fetch_ThrottledFallbackStillUpgradesProtection(t *testing.T) {
 	// evicted instead.
 	if ks := f.KeySet("configured-tenant"); ks == nil {
 		t.Error("expected the configured tenant's slot to survive eviction pressure after being upgraded to protected by a THROTTLED fallback attempt, but it was evicted")
+	}
+}
+
+// TestFetcher_GetKey_ConcurrentCacheMissesCoalesceInsteadOfFailing is a
+// regression test for a Copilot-review finding: the minFetchInterval
+// cooldown made concurrent cache-miss lookups for the SAME tenant fail
+// spuriously. The first GetKey call creates the tenant slot and starts
+// the (slow) HTTP fetch; any other concurrent call for the same
+// tenant/kid used to see the slot already exists, get throttled by
+// touchTenantLocked, and return an error immediately without ever
+// rechecking the cache — even though the first call's in-flight fetch
+// was about to populate exactly the keys it needed (e.g. right after a
+// cold start or a key rotation, when many requests arrive at once). It
+// proves many concurrent GetKey calls for the same tenant hitting a cold
+// cache simultaneously all succeed, coalesced onto the single in-flight
+// fetch rather than each independently risking the cooldown.
+func TestFetcher_GetKey_ConcurrentCacheMissesCoalesceInsteadOfFailing(t *testing.T) {
+	ks := testKeySet(t)
+	var reqCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		time.Sleep(50 * time.Millisecond) // widen the race window so concurrent callers reliably overlap
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	t.Cleanup(ts.Close)
+
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.minFetchInterval = time.Hour // deliberately long: without coalescing, every follower would be throttled
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := f.GetKey(context.Background(), "test-kid"); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("expected concurrent cache-miss lookups to succeed via coalescing, got: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&reqCount); got == 0 {
+		t.Error("expected at least 1 outbound JWKS request")
 	}
 }

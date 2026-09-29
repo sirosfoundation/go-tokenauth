@@ -79,6 +79,17 @@ type Fetcher struct {
 	client  *http.Client
 	mu      sync.RWMutex
 	keySets map[string]*jose.JSONWebKeySet
+	// inFlightFetches coalesces concurrent fetch calls for the SAME
+	// tenant: only the first caller for a given tenant actually runs
+	// admission/cooldown and the network round-trip; concurrent callers
+	// for that tenant wait on its channel instead of independently
+	// risking minFetchInterval throttling and returning a spurious error
+	// for a request the in-flight fetch was about to satisfy anyway (see
+	// fetch). Keyed and cleaned up per tenant, so its size is bounded by
+	// however many distinct tenants have a fetch genuinely in flight at
+	// once — inherently small and short-lived, not a new unbounded-growth
+	// vector on top of the existing admission/cache bounds.
+	inFlightFetches map[string]chan struct{}
 	// lru and lruElems bound keySets to maxCachedTenants entries (see its
 	// doc comment): lru's front is the most-recently-fetched tenant, back
 	// is the least-recently-fetched and the next to be evicted.
@@ -173,6 +184,7 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 		refresh:            refreshInterval,
 		client:             client,
 		keySets:            make(map[string]*jose.JSONWebKeySet),
+		inFlightFetches:    make(map[string]chan struct{}),
 		lru:                list.New(),
 		lruElems:           make(map[string]*list.Element),
 		cacheCapacity:      maxCachedTenants,
@@ -486,20 +498,47 @@ func (f *Fetcher) GetKey(ctx context.Context, kid string) ([]jose.JSONWebKey, er
 	return keys, nil
 }
 
-// fetch retrieves the JWKS from the remote endpoint and stores it in the
-// cache slot for ctx's effective tenant (see tenantForContext) — never in
-// a single shared slot that a different tenant's lookup could also read.
+// fetch retrieves the JWKS from the remote endpoint for ctx's effective
+// tenant (see tenantForContext) and stores it in that tenant's cache
+// slot — never in a single shared slot that a different tenant's lookup
+// could also read.
+//
+// Concurrent calls for the SAME tenant are coalesced: only the first
+// caller for a given tenant actually runs admission/cooldown and the
+// network round-trip; any other caller for that same tenant that arrives
+// while one is already in flight simply waits for it to finish and
+// returns nil, leaving GetKey's own post-fetch cache check to determine
+// the outcome. Without this, a burst of concurrent cache-miss lookups for
+// the same tenant (e.g. right after a cold start or a key rotation) would
+// have every caller but the first independently hit minFetchInterval's
+// cooldown and fail outright, even though the first caller's in-flight
+// fetch was about to satisfy all of them.
 func (f *Fetcher) fetch(ctx context.Context) error {
 	tenant, viaFallback := f.tenantForContext(ctx)
 
+	f.mu.Lock()
+	if ch, inFlight := f.inFlightFetches[tenant]; inFlight {
+		f.mu.Unlock()
+		<-ch
+		return nil // the in-flight fetch has completed; caller re-checks the cache itself
+	}
+	ch := make(chan struct{})
+	f.inFlightFetches[tenant] = ch
 	// touchTenantLocked decides both new-tenant admission and the
 	// minFetchInterval refetch cooldown in one atomic step (see its doc
 	// comment for why that matters) — bounding both tenant cardinality
 	// and, independently, how often any single tenant slot may be
 	// refetched at all.
-	f.mu.Lock()
 	allowed, attempt := f.touchTenantLocked(tenant, viaFallback)
 	f.mu.Unlock()
+
+	defer func() {
+		f.mu.Lock()
+		delete(f.inFlightFetches, tenant)
+		f.mu.Unlock()
+		close(ch)
+	}()
+
 	if !allowed {
 		return fmt.Errorf("jwks: refusing to fetch for tenant %q (rate-limited or attempted too soon)", tenant)
 	}
