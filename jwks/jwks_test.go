@@ -211,8 +211,12 @@ func TestFetcher_Fetch_UsesConfiguredTenantForCallsWithoutOne(t *testing.T) {
 	// so it isn't what's being exercised here.
 	f.minFetchInterval = 0
 
-	// Simulates a background-refresh fetch: no per-call tenant in ctx.
-	if err := f.fetch(context.Background()); err != nil {
+	// Simulates Start's internal background-refresh call: no per-call
+	// tenant in ctx, but explicitly marked as the internal refresh path
+	// (see internalRefreshContext) — an ordinary tenantless request
+	// context would NOT resolve to the configured tenant; see
+	// TestFetcher_GetKey_TenantlessRequestNeverUsesConfiguredTenant.
+	if err := f.fetch(internalRefreshContext(context.Background())); err != nil {
 		t.Fatalf("first fetch failed: %v", err)
 	}
 	// A real, per-call request's tenant always wins over the configured
@@ -220,9 +224,9 @@ func TestFetcher_Fetch_UsesConfiguredTenantForCallsWithoutOne(t *testing.T) {
 	if err := f.fetch(ContextWithTenantID(context.Background(), "request-tenant")); err != nil {
 		t.Fatalf("second fetch failed: %v", err)
 	}
-	// Another tenant-less call again falls back to the configured tenant,
-	// not whatever the previous per-call request happened to use.
-	if err := f.fetch(context.Background()); err != nil {
+	// Another internal-refresh call again falls back to the configured
+	// tenant, not whatever the previous per-call request happened to use.
+	if err := f.fetch(internalRefreshContext(context.Background())); err != nil {
 		t.Fatalf("third fetch failed: %v", err)
 	}
 
@@ -535,9 +539,10 @@ func TestFetcher_Fetch_ConfiguredTenantExemptFromEvictionAndAdmissionLimit(t *te
 	f.admissionWindow = time.Hour
 	f.minFetchInterval = 0 // this test re-fetches the configured tenant twice; unrelated to the cooldown
 
-	// protectedCtx carries no per-call tenant, so it resolves to the
-	// configured tenant (see tenantForContext).
-	protectedCtx := context.Background()
+	// protectedCtx simulates Start's internal refresh call: no per-call
+	// tenant, explicitly marked as the internal path, so it resolves to
+	// the configured tenant (see tenantForContext/internalRefreshContext).
+	protectedCtx := internalRefreshContext(context.Background())
 	if err := f.fetch(protectedCtx); err != nil {
 		t.Fatalf("initial fetch for the configured tenant failed: %v", err)
 	}
@@ -586,8 +591,8 @@ func TestFetcher_Fetch_SpoofedTenantClaimNotExemptFromAdmissionLimit(t *testing.
 		t.Error("expected an explicit claim matching the configured tenant string to be subject to the admission limit, not exempt")
 	}
 
-	if err := f.fetch(context.Background()); err != nil {
-		t.Errorf("expected the genuine fallback path (no per-call tenant) to remain exempt from the admission limit, got: %v", err)
+	if err := f.fetch(internalRefreshContext(context.Background())); err != nil {
+		t.Errorf("expected the genuine fallback path (Start's internal refresh) to remain exempt from the admission limit, got: %v", err)
 	}
 }
 
@@ -734,10 +739,10 @@ func TestFetcher_Fetch_UpgradesExistingSlotToProtectedOnGenuineFallback(t *testi
 		t.Fatalf("spoofed fetch failed: %v", err)
 	}
 
-	// A genuine fallback fetch (e.g. the background-refresh ticker) later
+	// A genuine fallback fetch (e.g. Start's internal refresh) later
 	// claims the SAME tenant string — this must upgrade the existing
 	// entry to protected.
-	if err := f.fetch(context.Background()); err != nil {
+	if err := f.fetch(internalRefreshContext(context.Background())); err != nil {
 		t.Fatalf("genuine fallback fetch failed: %v", err)
 	}
 
@@ -755,5 +760,107 @@ func TestFetcher_Fetch_UpgradesExistingSlotToProtectedOnGenuineFallback(t *testi
 	// been evicted instead.
 	if ks := f.KeySet("configured-tenant"); ks == nil {
 		t.Error("expected the configured tenant's slot to survive after being upgraded to protected by a genuine fallback fetch, but it was evicted")
+	}
+}
+
+// TestFetcher_GetKey_TenantlessRequestNeverUsesConfiguredTenant is a
+// regression test for a Copilot-review finding: Config.TenantID (the
+// static fallback) is documented as being for Start's internal background
+// refresh only, but tenantForContext used to apply it to ANY call whose
+// ctx carried no per-call tenant — including ordinary, external,
+// request-driven GetKey lookups whose token simply has no tenant claim at
+// all. That could silently route a genuinely tenantless request to the
+// WRONG tenant's JWKS slot and header. It proves an ordinary GetKey call
+// with no per-call tenant resolves to the plain untenanted ("") slot and
+// sends no X-Tenant-ID header, never the configured tenant's, even with a
+// configured tenant set.
+func TestFetcher_GetKey_TenantlessRequestNeverUsesConfiguredTenant(t *testing.T) {
+	tenants := &tenantRecorder{}
+	ts := testJWKSServer(t, tenants)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+
+	// An ordinary request-driven GetKey call with no per-call tenant — NOT
+	// Start's internal refresh (see internalRefreshContext).
+	if _, err := f.GetKey(context.Background(), "test-kid"); err != nil {
+		t.Fatalf("GetKey failed: %v", err)
+	}
+
+	headers := tenants.all()
+	if len(headers) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(headers))
+	}
+	if headers[0] != "" {
+		t.Errorf("expected an ordinary tenantless request to send no X-Tenant-ID header, got %q (misrouted to the configured tenant)", headers[0])
+	}
+
+	if ks := f.KeySet("configured-tenant"); ks != nil {
+		t.Error("expected the configured tenant's slot to remain untouched by an ordinary tenantless request")
+	}
+	if ks := f.KeySet(""); ks == nil {
+		t.Error("expected the ordinary tenantless request to populate the plain \"\" slot instead")
+	}
+}
+
+// TestFetcher_CommitFetchResult_DiscardsStaleGenerations is a regression
+// test for a Copilot-review finding: fetch's HTTP round-trip runs without
+// holding f.mu, so a slow response could otherwise resurrect an evicted
+// entry (with no corresponding LRU node, breaking the cacheCapacity
+// bound) or overwrite a newer attempt's fresher keys with an older,
+// superseded one's stale response. It exercises commitFetchResultLocked
+// directly to prove: (a) a response for a tenant whose slot doesn't exist
+// (never admitted, or already evicted) is discarded, never resurrecting
+// keySets without a corresponding LRU entry; and (b) a response carrying
+// an outdated generation (superseded by a newer, already-admitted attempt
+// for the same tenant) is discarded rather than overwriting the newer
+// attempt's keys.
+func TestFetcher_CommitFetchResult_DiscardsStaleGenerations(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "")
+	f.minFetchInterval = 0
+
+	staleKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{KeyID: "stale-key"}}}
+	freshKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{KeyID: "fresh-key"}}}
+
+	// (a) A response for a tenant with no LRU entry at all must be
+	// discarded, not resurrected into keySets.
+	f.mu.Lock()
+	f.commitFetchResultLocked("never-admitted-tenant", 1, staleKS)
+	f.mu.Unlock()
+	if ks := f.KeySet("never-admitted-tenant"); ks != nil {
+		t.Error("expected a response for a tenant with no LRU entry to be discarded, not resurrected into keySets")
+	}
+
+	// (b) Simulate two attempts for the same tenant: an older one
+	// (generation 1) whose response arrives late, after a newer attempt
+	// (generation 2) has already been admitted and committed its own,
+	// fresher response.
+	f.mu.Lock()
+	_, gen1 := f.touchTenantLocked("race-tenant", false)
+	f.mu.Unlock()
+	if gen1 != 1 {
+		t.Fatalf("expected the first admission to be generation 1, got %d", gen1)
+	}
+
+	f.mu.Lock()
+	_, gen2 := f.touchTenantLocked("race-tenant", false)
+	f.mu.Unlock()
+	if gen2 != 2 {
+		t.Fatalf("expected the second admission to be generation 2, got %d", gen2)
+	}
+
+	// The newer attempt's response arrives and commits first.
+	f.mu.Lock()
+	f.commitFetchResultLocked("race-tenant", gen2, freshKS)
+	f.mu.Unlock()
+
+	// The OLDER attempt's response arrives late and must be discarded,
+	// not overwrite the fresher keys.
+	f.mu.Lock()
+	f.commitFetchResultLocked("race-tenant", gen1, staleKS)
+	f.mu.Unlock()
+
+	ks := f.KeySet("race-tenant")
+	if ks == nil || len(ks.Keys) != 1 || ks.Keys[0].KeyID != "fresh-key" {
+		t.Errorf("expected the newer (generation 2) keys to survive a stale (generation 1) late response, got %+v", ks)
 	}
 }

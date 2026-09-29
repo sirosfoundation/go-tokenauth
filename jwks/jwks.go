@@ -125,6 +125,20 @@ func ContextWithTenantID(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, tenantIDContextKey{}, tenantID)
 }
 
+type internalRefreshContextKey struct{}
+
+// internalRefreshContext marks ctx as Start's own internal background
+// refresh — never set by, or reachable from, any external request. "ctx
+// carries no explicit tenant claim" is true both for a genuine internal
+// refresh AND for an ordinary per-call request whose token simply has no
+// tenant/tenant_id claim (or an invalidated one); those are NOT the same
+// trust level, so tenantForContext checks for this marker explicitly
+// rather than treating "no claim" alone as license to use
+// configuredTenantID. Only Start applies this marker (see its use there).
+func internalRefreshContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, internalRefreshContextKey{}, true)
+}
+
 // NewFetcher creates a JWKS fetcher for the given URL.
 // If refreshInterval is 0, defaults to 5 minutes.
 // If client is nil, http.DefaultClient is used.
@@ -170,36 +184,52 @@ func NewFetcher(url string, refreshInterval time.Duration, client *http.Client, 
 // lastAttempt records when a fetch was last attempted for this tenant
 // (successful or not), enforcing minFetchInterval between attempts
 // regardless of protected/admission status — see defaultMinFetchInterval.
+//
+// generation increments on every attempt admitted for this tenant slot
+// (see touchTenantLocked). The HTTP round-trip in fetch runs without
+// holding f.mu, so an in-flight response may outlive its slot's eviction,
+// or a newer attempt for the same tenant may be admitted before an older
+// one's response arrives. fetch captures the generation it was admitted
+// under and only commits its response if that generation is still current
+// when the response comes back — see fetch's commit step. This prevents a
+// stale response from resurrecting an evicted entry (with no
+// corresponding lru node, breaking the cacheCapacity bound) or from
+// overwriting a newer attempt's fresher keys.
 type tenantLRUEntry struct {
 	tenant      string
 	protected   bool
 	lastAttempt time.Time
+	generation  uint64
 }
 
 // touchTenantLocked records an attempt to fetch tenant right now. For an
 // existing entry it enforces minFetchInterval since that tenant's last
-// attempt (returning false, without updating anything, if attempted too
-// soon) and upgrades protected to true if this attempt is viaFallback. For
-// a brand-new tenant it creates the entry (lastAttempt = now, protected =
-// viaFallback), evicting the least-recently-attempted non-protected entry
-// first if the cache is already at cacheCapacity. Caller must hold f.mu
-// (write lock). The returned bool reports whether the attempt may proceed
-// to the network; fetch must not do so if it returns false.
-func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) bool {
+// attempt (returning allowed=false, without updating anything, if
+// attempted too soon) and upgrades protected to true if this attempt is
+// viaFallback. For a brand-new tenant it creates the entry (lastAttempt =
+// now, protected = viaFallback, generation = 1), evicting the
+// least-recently-attempted non-protected entry first if the cache is
+// already at cacheCapacity. Caller must hold f.mu (write lock). allowed
+// reports whether the attempt may proceed to the network — fetch must not
+// do so if it's false. generation is this attempt's slot generation;
+// fetch must pass it back to commitFetchResultLocked and must not commit
+// a response under any other generation.
+func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bool, generation uint64) {
 	now := time.Now()
 
 	if el, ok := f.lruElems[tenant]; ok {
 		entry, _ := el.Value.(tenantLRUEntry) // always this type: only touchTenantLocked pushes onto lru
 		if now.Sub(entry.lastAttempt) < f.minFetchInterval {
-			return false
+			return false, 0
 		}
 		entry.lastAttempt = now
+		entry.generation++
 		if viaFallback {
 			entry.protected = true
 		}
 		el.Value = entry
 		f.lru.MoveToFront(el)
-		return true
+		return true, entry.generation
 	}
 
 	if f.lru.Len() >= f.cacheCapacity {
@@ -218,8 +248,30 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) bool {
 		// and the cache simply grows by one rather than evicting
 		// protected state.
 	}
-	f.lruElems[tenant] = f.lru.PushFront(tenantLRUEntry{tenant: tenant, protected: viaFallback, lastAttempt: now})
-	return true
+	entry := tenantLRUEntry{tenant: tenant, protected: viaFallback, lastAttempt: now, generation: 1}
+	f.lruElems[tenant] = f.lru.PushFront(entry)
+	return true, entry.generation
+}
+
+// commitFetchResultLocked stores ks for tenant only if tenant's cache slot
+// is still at exactly the generation this fetch attempt was admitted
+// under (see touchTenantLocked) — i.e. the slot hasn't since been evicted,
+// and no newer attempt for the same tenant has been admitted ahead of this
+// response arriving. A stale response (slot gone, or superseded by a
+// newer generation) is silently discarded rather than resurrecting an
+// evicted entry or overwriting fresher keys with older ones. Caller must
+// hold f.mu (write lock).
+func (f *Fetcher) commitFetchResultLocked(tenant string, generation uint64, ks *jose.JSONWebKeySet) {
+	el, ok := f.lruElems[tenant]
+	if !ok {
+		return // slot was evicted before this response arrived — discard
+	}
+	entry, _ := el.Value.(tenantLRUEntry)
+	if entry.generation != generation {
+		return // superseded by a newer attempt for the same tenant — discard
+	}
+	f.keySets[tenant] = ks
+	f.lastFetch = time.Now()
 }
 
 // admitNewTenant reports whether a fetch for tenant may proceed right now.
@@ -262,30 +314,46 @@ func (f *Fetcher) admitNewTenant(tenant string, viaFallback bool) bool {
 
 // tenantForContext resolves the effective tenant key to use for both the
 // outbound X-Tenant-ID header and the per-tenant cache slot: a per-call
-// tenant from ctx if present, otherwise the static, operator-configured
-// fallback, otherwise "" (the untenanted default slot). fetch and GetKey
-// both call this so they always agree on which tenant a given call is for.
+// tenant from ctx if present; otherwise the static, operator-configured
+// fallback IF ctx is a genuine internal-refresh call (see
+// internalRefreshContext); otherwise "" (the untenanted default slot,
+// used by ordinary per-call requests whose token carries no tenant claim
+// at all). fetch and GetKey both call this so they always agree on which
+// tenant a given call is for.
 //
-// viaFallback reports whether tenant came from the static fallback
-// (configuredTenantID, or "" if unset) because ctx carried no per-call
-// tenant at all — never because an explicit per-call claim happened to
-// equal that same string. This distinction matters: only the fallback
-// path is trusted, operator-configured provenance (see admitNewTenant and
-// touchTenantLocked's protected flag); an attacker's own claim must never
-// be able to buy the same trust merely by matching its value.
+// An ordinary request with no tenant claim resolving to configuredTenantID
+// would be wrong: Config.TenantID exists solely to keep Start's background
+// refresh warm for one known, operator-chosen tenant, not to silently
+// reroute real, tenantless request-driven lookups to it — that could
+// select the wrong tenant's keys for validation. Distinguishing "no claim"
+// from "genuine internal refresh" is exactly what prevents that: only
+// Start's own calls carry the internalRefreshContext marker.
+//
+// viaFallback reports whether tenant came from that static, internal-only
+// fallback — never because an explicit per-call claim happened to equal
+// that same string, and never merely because a request lacked a tenant
+// claim. This distinction matters: only the fallback path is trusted,
+// operator-configured provenance (see admitNewTenant and
+// touchTenantLocked's protected flag); an attacker's own claim (or an
+// ordinary request's absent claim) must never be able to buy the same
+// trust.
 func (f *Fetcher) tenantForContext(ctx context.Context) (tenant string, viaFallback bool) {
 	if tenantID, ok := ctx.Value(tenantIDContextKey{}).(string); ok && tenantID != "" {
 		return tenantID, false
 	}
-	return f.configuredTenantID, true
+	if isInternalRefresh, _ := ctx.Value(internalRefreshContextKey{}).(bool); isInternalRefresh {
+		return f.configuredTenantID, true
+	}
+	return "", false
 }
 
 // Start begins background key refresh. Call Stop() to clean up.
 func (f *Fetcher) Start(ctx context.Context) {
 	ctx, f.cancel = context.WithCancel(ctx)
+	refreshCtx := internalRefreshContext(ctx)
 
 	// Initial fetch (best-effort).
-	_ = f.fetch(ctx)
+	_ = f.fetch(refreshCtx)
 
 	go func() {
 		ticker := time.NewTicker(f.refresh)
@@ -293,7 +361,7 @@ func (f *Fetcher) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
-				_ = f.fetch(ctx)
+				_ = f.fetch(refreshCtx)
 			case <-ctx.Done():
 				return
 			}
@@ -372,7 +440,7 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	// tenant identity/cardinality — see defaultMinFetchInterval for why
 	// that's a separate axis of protection from admitNewTenant.
 	f.mu.Lock()
-	allowed := f.touchTenantLocked(tenant, viaFallback)
+	allowed, generation := f.touchTenantLocked(tenant, viaFallback)
 	f.mu.Unlock()
 	if !allowed {
 		return fmt.Errorf("jwks: refetch for tenant %q attempted too soon; refusing (minimum interval %s)", tenant, f.minFetchInterval)
@@ -410,8 +478,7 @@ func (f *Fetcher) fetch(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
-	f.keySets[tenant] = &ks
-	f.lastFetch = time.Now()
+	f.commitFetchResultLocked(tenant, generation, &ks)
 	f.mu.Unlock()
 
 	return nil
