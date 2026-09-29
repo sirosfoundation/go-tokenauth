@@ -268,15 +268,26 @@ func (f *Fetcher) touchTenantLocked(tenant string, viaFallback bool) (allowed bo
 
 	if el, ok := f.lruElems[tenant]; ok {
 		entry, _ := el.Value.(tenantLRUEntry) // always this type: only touchTenantLocked pushes onto lru
-		if now.Sub(entry.lastAttempt) < f.minFetchInterval {
-			return false, fetchAttempt{}
-		}
-		f.nextGeneration++
-		entry.lastAttempt = now
+		// Apply the protected upgrade unconditionally, even if this
+		// attempt turns out to be throttled below: a genuine fallback
+		// call must still be able to mark an existing (e.g.
+		// spoofed-claim-created) slot as protected without needing to
+		// reach the network. Deferring this past the throttle check would
+		// let a slot the fallback path hasn't yet had an UNTHROTTLED
+		// chance to touch remain evictable indefinitely under sustained
+		// churn.
 		if viaFallback {
 			entry.protected = true
 		}
+		throttled := now.Sub(entry.lastAttempt) < f.minFetchInterval
+		if !throttled {
+			f.nextGeneration++
+			entry.lastAttempt = now
+		}
 		el.Value = entry
+		if throttled {
+			return false, fetchAttempt{}
+		}
 		f.lru.MoveToFront(el)
 		return true, fetchAttempt{incarnation: entry.incarnation, seq: f.nextGeneration}
 	}

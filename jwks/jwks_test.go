@@ -1059,3 +1059,53 @@ func TestFetcher_Fetch_RejectsAdmissionWhenNothingEvictable(t *testing.T) {
 		t.Errorf("expected the refused admission's budget charge to be rolled back to 0, got %d", admissionCount)
 	}
 }
+
+// TestFetcher_Fetch_ThrottledFallbackStillUpgradesProtection is a
+// regression test for a Copilot-review finding: the protected-upgrade
+// logic in touchTenantLocked used to run AFTER the minFetchInterval
+// cooldown check, so a genuine fallback attempt arriving within the
+// cooldown window of an earlier, spoofed-claim-created slot was throttled
+// before it ever got to mark that slot protected — leaving it evictable
+// until some later, untethered fallback attempt happened to land outside
+// the cooldown window. It proves a throttled fallback attempt still
+// upgrades the slot to protected, even though the attempt itself is
+// refused (no network call happens for it).
+func TestFetcher_Fetch_ThrottledFallbackStillUpgradesProtection(t *testing.T) {
+	ts := testPerTenantJWKSServer(t)
+	f := NewFetcher(ts.URL, 0, nil, "configured-tenant")
+	f.cacheCapacity = 2
+	f.admissionLimit = 10
+	f.admissionWindow = time.Hour
+	f.minFetchInterval = time.Hour // long cooldown: the second call below is deliberately throttled
+
+	// An attacker's explicit claim reaches the fetcher first — creates an
+	// UNPROTECTED entry for "configured-tenant".
+	spoofedCtx := ContextWithTenantID(context.Background(), "configured-tenant")
+	if err := f.fetch(spoofedCtx); err != nil {
+		t.Fatalf("spoofed fetch failed: %v", err)
+	}
+
+	// A genuine fallback attempt arrives within the cooldown window and
+	// is throttled (no network call) — but it must still upgrade the slot
+	// to protected.
+	if err := f.fetch(internalRefreshContext(context.Background())); err == nil {
+		t.Fatal("expected the fallback attempt within the cooldown window to be throttled")
+	}
+
+	// Fill the rest of the small cache with an unrelated tenant, then add
+	// one more to force eviction pressure.
+	if err := f.fetch(ContextWithTenantID(context.Background(), "other-tenant")); err != nil {
+		t.Fatalf("other-tenant fetch failed: %v", err)
+	}
+	if err := f.fetch(ContextWithTenantID(context.Background(), "third-tenant")); err != nil {
+		t.Fatalf("third-tenant fetch failed: %v", err)
+	}
+
+	// The now-protected "configured-tenant" slot must have survived even
+	// though the fallback attempt that upgraded it was itself throttled —
+	// "other-tenant" (the only non-protected entry left) should have been
+	// evicted instead.
+	if ks := f.KeySet("configured-tenant"); ks == nil {
+		t.Error("expected the configured tenant's slot to survive eviction pressure after being upgraded to protected by a THROTTLED fallback attempt, but it was evicted")
+	}
+}
