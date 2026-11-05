@@ -95,7 +95,8 @@ func extractBearerToken(c *gin.Context) string {
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 		return ""
 	}
-	return parts[1]
+	// A scheme followed only by whitespace carries no credential.
+	return strings.TrimSpace(parts[1])
 }
 
 // invalidTokenDescription distinguishes an expired token from every

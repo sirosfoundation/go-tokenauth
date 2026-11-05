@@ -142,6 +142,24 @@ func TestTokenAuth_NoToken(t *testing.T) {
 	}
 }
 
+// A Bearer scheme followed only by whitespace presents no credential, so
+// it gets the invalid_request challenge, not invalid_token.
+func TestTokenAuth_WhitespaceOnlyToken(t *testing.T) {
+	router, _, _ := setupMiddleware(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer    ")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+	if want, got := `Bearer error="invalid_request"`, w.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
 func TestTokenAuth_InvalidToken(t *testing.T) {
 	router, _, _ := setupMiddleware(t)
 
