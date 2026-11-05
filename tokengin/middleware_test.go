@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	gojose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	gojwt "github.com/golang-jwt/jwt/v5"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-tokenauth/validator"
@@ -129,6 +130,16 @@ func TestTokenAuth_NoToken(t *testing.T) {
 	if want, got := `Bearer error="invalid_request"`, w.Header().Get("WWW-Authenticate"); got != want {
 		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
 	}
+
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	// The pre-existing body must not change — existing consumers may
+	// already match on it.
+	if got := body["error"]; got != "missing authorization token" {
+		t.Errorf(`body["error"] = %q, want "missing authorization token"`, got)
+	}
 }
 
 func TestTokenAuth_InvalidToken(t *testing.T) {
@@ -209,6 +220,53 @@ func TestTokenAuth_ExpiredToken(t *testing.T) {
 	}
 	if got := body["error_description"]; got != "the access token expired" {
 		t.Errorf(`body["error_description"] = %q, want "the access token expired"`, got)
+	}
+}
+
+// TestTokenAuth_ExpiredLegacyToken covers the golang-jwt expiry sentinel:
+// legacy HS256 validation wraps golangjwt.ErrTokenExpired, a different
+// error from the go-jose ErrExpired the asymmetric path produces.
+func TestTokenAuth_ExpiredLegacyToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+
+	v := validator.New(validator.Config{
+		Audiences: []string{"api"},
+		Legacy: validator.LegacyConfig{
+			Enabled:    true,
+			HMACSecret: secret,
+			Issuers:    []string{"test-issuer"},
+		},
+	})
+	router := gin.New()
+	router.GET("/protected", TokenAuth(v), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	now := time.Now()
+	token, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, validator.LegacyTokenClaims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ID:        "jti-legacy-expired",
+			Issuer:    "test-issuer",
+			Audience:  gojwt.ClaimStrings{"api"},
+			IssuedAt:  gojwt.NewNumericDate(now.Add(-time.Hour)),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(-time.Minute)),
+		},
+		UserID:   "user-1",
+		TenantID: "tenant-1",
+	}).SignedString(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+	if want, got := `Bearer error="invalid_token", error_description="the access token expired"`, w.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
 	}
 }
 
